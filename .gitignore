@@ -32,6 +32,7 @@ Thumbs.db
 data/chroma/
 data/*.json
 data/test_docs/
+docs/*
 
 # Logs
 *.log
