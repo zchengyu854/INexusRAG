@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+uv.lock
+.venv/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (may contain sensitive test/sample data)
+data/chroma/
+data/*.json
+data/test_docs/
+
+# Logs
+*.log
+
+# Node (Streamlit UI)
+ui/.streamlit/
+node_modules/
+ui/node_modules/
+
+# PI / AI agent tooling (internal use only)
+.pi/
+.agents/
+.claude/
+skills-lock.json
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Temporary
+*.tmp
+*.temp
