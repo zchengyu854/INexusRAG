@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # NexusRAG 启动脚本
-# 用法:
-#   ./run.sh [backend|ui|preview|all]
-#   ./run.sh preview data/test_docs/fastapi_readme.md [--chunk-size 300] [-v]
+# 用法: ./run.sh [backend|ui|all]
 
 set -e
 
@@ -14,11 +12,6 @@ case "${1:-all}" in
   ui)
     echo "🎨 启动 UI :8501 ..."
     uv run streamlit run ui/app.py --server.port 8501
-    ;;
-  preview)
-    shift
-    echo "🔍 预览文档切分 ..."
-    exec uv run python -m src.cli.preview "$@"
     ;;
   all)
     echo "🚀 启动后端 :8000 ..."
@@ -36,7 +29,7 @@ case "${1:-all}" in
     wait $PID_API $PID_UI
     ;;
   *)
-    echo "用法: ./run.sh [backend|ui|preview|all]"
+    echo "用法: ./run.sh [backend|ui|all]"
     exit 1
     ;;
 esac

@@ -20,10 +20,14 @@ from src.api.schemas import (
     DocInfo,
     QueryRequest,
     QueryResponse,
+    RechunkRequest,
+    RechunkResult,
     SystemStats,
 )
 from src.ingestion.embedder import get_embedder
 from src.ingestion.ingestion_pipeline import ingest_document
+from src.ingestion.loaders import load
+from src.ingestion.splitter import split_text
 from src.ingestion.vector_store import get_vector_store
 
 router = APIRouter(prefix="/api")
@@ -125,6 +129,8 @@ async def get_stats():
     emb      = _load_embeddings()
     store    = get_vector_store()
     emb_dim  = next(iter(emb.values()))[0] if emb else 1024
+    if isinstance(emb_dim, list):
+        emb_dim = len(emb_dim) if emb_dim else 1024
 
     total_chunks = sum(d["chunks"] for d in docs.values())
     total_size = 0
@@ -137,6 +143,58 @@ async def get_stats():
         total_chunks=total_chunks,
         embedding_dimension=emb_dim,
         total_size_kb=round(total_size, 1),
+    )
+
+
+@router.post("/documents/{doc_id}/preview", response_model=ChunksPreviewResponse)
+async def preview_rechunk(doc_id: str, req: RechunkRequest):
+    """预览新参数下的切片结果，不写入向量库，不消耗 embedding。"""
+    docs = _load_docs()
+    if doc_id not in docs:
+        raise HTTPException(404, "文档不存在")
+
+    doc_cfg = docs[doc_id]
+    filename = doc_cfg["filename"]
+
+    search_dirs = [Path("data/test_docs"), Path("data")]
+    src_path = None
+    for d in search_dirs:
+        found = list(d.glob(filename))
+        if found:
+            src_path = found[0]
+            break
+    if src_path is None:
+        raise HTTPException(404, f"未找到源文件: {filename}")
+
+    text = load(src_path)
+    chunks = split_text(
+        text,
+        doc_name=filename,
+        chunk_size=req.chunk_size,
+        chunk_overlap=req.chunk_overlap,
+        strategy=req.strategy,
+    )
+    if not chunks:
+        raise ValueError("切片后无有效内容")
+
+    previews = []
+    co = req.chunk_overlap
+    for i, c in enumerate(chunks):
+        previews.append(DocChunkPreview(
+            index=i,
+            chunk_id=f"{filename}-{i}",
+            text=c.text,
+            length=len(c.text),
+            overlap_with_next=min(co, len(c.text)),
+        ))
+    return ChunksPreviewResponse(
+        doc_id=doc_id,
+        filename=filename,
+        total_chunks=len(chunks),
+        strategy=req.strategy,
+        chunk_size=req.chunk_size,
+        chunk_overlap=req.chunk_overlap,
+        chunks=previews,
     )
 
 
@@ -324,6 +382,106 @@ async def _sse_stream(req: QueryRequest) -> AsyncGenerator[str, None]:
         answer = "未检索到相关内容，请先上传并入库文档。"
     yield (f'data: {json.dumps({"type": "token", "data": answer}, ensure_ascii=False)}\n\n')
     yield 'data: {"type": "done", "data": null}\n\n'
+
+
+@router.post("/documents/{doc_id}/rechunk", response_model=RechunkResult)
+async def rechunk_document(doc_id: str, req: RechunkRequest):
+    """用新参数重新切片，全量重算 embedding（切法变了切片内容必然不同）。"""
+    docs = _load_docs()
+    if doc_id not in docs:
+        raise HTTPException(404, "文档不存在")
+
+    doc_cfg = docs[doc_id]
+    filename = doc_cfg["filename"]
+    old_config = DocConfig(**doc_cfg.get("config", {}))
+
+    # 找到源文件
+    search_dirs = [Path("data/test_docs"), Path("data")]
+    src_path = None
+    for d in search_dirs:
+        found = list(d.glob(filename))
+        if found:
+            src_path = found[0]
+            break
+    if src_path is None:
+        raise HTTPException(404, f"未找到源文件: {filename}")
+
+    t0 = time.perf_counter()
+
+    try:
+        # 1. 删除旧向量
+        store = get_vector_store()
+        store.delete(filename)
+
+        # 2. 删除旧缓存
+        _save_chunks({k: v for k, v in _load_chunks().items() if k != doc_id})
+        _save_embeddings({k: v for k, v in _load_embeddings().items() if k != doc_id})
+
+        # 3. 重新切分
+        from src.ingestion.embedder import get_embedder
+        text = load(src_path)
+        chunks = split_text(
+            text,
+            doc_name=filename,
+            chunk_size=req.chunk_size,
+            chunk_overlap=req.chunk_overlap,
+            strategy=req.strategy,
+        )
+        if not chunks:
+            raise ValueError("切片后无有效内容")
+
+        # 4. 编码（切法变了，无法复用旧 embedding）
+        new_texts = [c.text for c in chunks]
+        embeddings = get_embedder().encode(new_texts)
+
+        # 5. 写入
+        chunk_ids = store.add(filename, new_texts, embeddings)
+        _save_chunks({doc_id: new_texts})
+        _save_embeddings({doc_id: [_truncate_embed(e) for e in embeddings]})
+
+        new_config = DocConfig(
+            strategy=req.strategy,
+            chunk_size=req.chunk_size,
+            chunk_overlap=req.chunk_overlap,
+        )
+        latency_ms = (time.perf_counter() - t0) * 1000
+
+        docs[doc_id].update({
+            "status": "ready",
+            "chunks": len(chunk_ids),
+            "latency_ms": round(latency_ms, 1),
+            "config": {"strategy": req.strategy, "chunk_size": req.chunk_size, "chunk_overlap": req.chunk_overlap},
+            "error": None,
+        })
+        _save_docs(docs)
+
+        return RechunkResult(
+            doc_id=doc_id,
+            filename=filename,
+            old_chunks=doc_cfg.get("chunks", 0),
+            new_chunks=len(chunk_ids),
+            old_config=old_config,
+            new_config=new_config,
+            latency_ms=round(latency_ms, 1),
+            success=True,
+            reused_embeddings=0,
+            new_embeddings=len(chunk_ids),
+        )
+    except Exception as e:
+        docs[doc_id]["status"] = "failed"
+        docs[doc_id]["error"] = str(e)
+        _save_docs(docs)
+        return RechunkResult(
+            doc_id=doc_id,
+            filename=filename,
+            old_chunks=doc_cfg.get("chunks", 0),
+            new_chunks=0,
+            old_config=old_config,
+            new_config=DocConfig(strategy=req.strategy, chunk_size=req.chunk_size, chunk_overlap=req.chunk_overlap),
+            latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+            success=False,
+            error=str(e),
+        )
 
 
 @router.get("/documents", response_model=list[DocInfo])

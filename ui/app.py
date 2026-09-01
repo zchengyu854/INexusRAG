@@ -220,6 +220,64 @@ def _chunk_viewer(doc: dict):
                 _trigger_ingest(doc["id"])
             st.rerun()
 
+    # ── 重新切片面板 ──
+    st.markdown("---")
+    with st.expander("⚙ 重新切片 Rechunk"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            new_chunk_size = st.number_input("Chunk Size", min_value=64, max_value=4096, value=cfg.get('chunk_size', 512), step=64)
+        with col2:
+            new_overlap = st.number_input("Overlap", min_value=0, max_value=4095, value=cfg.get('chunk_overlap', 64), step=32)
+        with col3:
+            new_strategy = st.selectbox("Strategy", ["recursive", "sentence"], index=0 if cfg.get('strategy') == 'recursive' else 1)
+
+        col_preview, col_rechunk = st.columns(2)
+        with col_preview:
+            if st.button("👁 预览切片", use_container_width=True):
+                try:
+                    preview_resp = _api(
+                        f"/documents/{doc['id']}/preview",
+                        "POST",
+                        json={
+                            "chunk_size": new_chunk_size,
+                            "chunk_overlap": new_overlap,
+                            "strategy": new_strategy,
+                        },
+                    )
+                    st.info(f"预览: {preview_resp['total_chunks']} chunks (size={new_chunk_size}, overlap={new_overlap})")
+                    for ch in preview_resp.get("chunks", [])[:10]:
+                        st.markdown(f"**#{ch['index']}** · {ch['length']} chars")
+                        st.code(ch["text"][:200], language="text")
+                    if preview_resp['total_chunks'] > 10:
+                        st.caption(f"… 仅显示前 10 个，共 {preview_resp['total_chunks']} 个")
+                except Exception as e:
+                    st.error(f"预览失败: {e}")
+
+        with col_rechunk:
+            if st.button("🔄 确认重新切片", use_container_width=True, type="primary"):
+                with st.spinner("Rechunking..."):
+                    try:
+                        resp = _api(
+                            f"/documents/{doc['id']}/rechunk",
+                            "POST",
+                            json={
+                                "chunk_size": new_chunk_size,
+                                "chunk_overlap": new_overlap,
+                                "strategy": new_strategy,
+                            },
+                        )
+                        if resp["success"]:
+                            st.success(
+                                f"✅ {resp['old_chunks']} → {resp['new_chunks']} chunks | "
+                                f"耗时 {resp['latency_ms']:.0f}ms | "
+                                f"embedding 已全量重算 ({resp['new_embeddings']} 个)"
+                            )
+                        else:
+                            st.error(f"❌ 失败: {resp.get('error')}")
+                    except Exception as e:
+                        st.error(f"请求失败: {e}")
+                st.rerun()
+
     if st.button("Delete", use_container_width=True):
         try:
             _api(f"/documents/{doc['id']}", "DELETE")

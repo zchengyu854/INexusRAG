@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import logging
 import re
 from dataclasses import dataclass
 from typing import Literal
 
 from src.ingestion.loaders import load
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -55,52 +52,36 @@ class TextSplitter:
 
         # Step 1: fence 预切分 → [prose, code, ...] 交替序列
         segments = self._split_by_fences(text)
-        logger.info("fence split: %d segments", len(segments))
 
         # Step 2-3: prose 按标题切 section，再按空行切段落；代码块保持原子
         units: list[dict] = []  # [{"text": ..., "type": "prose"|"code", "meta": ...}]
         for seg_type, seg_content, seg_meta in segments:
             if seg_type == "code":
                 units.append({"text": seg_content, "type": "code", "meta": seg_meta})
-                logger.debug("code block: %d chars, lang=%s", len(seg_content), seg_meta.get("lang") if seg_meta else None)
             else:
-                sections = list(self._split_prose_by_headings(seg_content))
-                logger.info("prose: %d sections", len(sections))
-                for section in sections:
-                    paras = list(self._split_by_paragraphs(section))
-                    for para in paras:
+                for section in self._split_prose_by_headings(seg_content):
+                    for para in self._split_by_paragraphs(section):
                         if para.strip():
                             units.append({"text": para, "type": "prose", "meta": None})
 
         # Step 5: 超限单元降级 —— 代码块按空行/行组切，段落回退 sentence
         degraded: list[dict] = []
-        degraded_count = 0
         for u in units:
             if len(u["text"]) <= self.chunk_size:
                 degraded.append(u)
             elif u["type"] == "code":
                 degraded.extend(self._degrade_code(u["text"], u["meta"]))
-                degraded_count += 1
             else:
                 degraded.extend(self._degrade_paragraph(u["text"]))
-                degraded_count += 1
-        if degraded_count:
-            logger.info("degraded %d oversized units", degraded_count)
 
         # Step 4: 贪心装箱
         chunks = self._greedy_pack(degraded)
 
         # Step 7: 短尾块并入前块（在 overlap 之前，避免短块被 overlap 膨胀后跳过合并）
-        before_merge = len(chunks)
         chunks = self._merge_short_tail(chunks)
-        if len(chunks) < before_merge:
-            logger.info("merged %d short tails into previous chunks", before_merge - len(chunks))
 
         # Step 6: 单元级 overlap
-        if self.chunk_overlap > 0:
-            chunks = self._apply_overlap(chunks)
-
-        logger.info("total chunks: %d", len(chunks))
+        chunks = self._apply_overlap(chunks)
 
         # 生成最终 Chunk 对象
         result: list[Chunk] = []

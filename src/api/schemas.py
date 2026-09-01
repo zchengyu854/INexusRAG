@@ -39,6 +39,24 @@ class DocConfig(BaseModel):
     embedding_dimension: int = 0
 
 
+class RechunkRequest(BaseModel):
+    chunk_size: int = Field(512, ge=64, le=4096)
+    chunk_overlap: int = Field(64, ge=0, lt=4096)
+    strategy: str = "recursive"
+
+
+class RechunkResult(BaseModel):
+    doc_id: str
+    filename: str
+    old_chunks: int
+    new_chunks: int
+    old_config: DocConfig
+    new_config: DocConfig
+    latency_ms: float
+    success: bool
+    error: str | None = None
+
+
 class DocDetail(BaseModel):
     id: str
     filename: str
