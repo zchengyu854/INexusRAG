@@ -139,7 +139,6 @@ nexus-rag/
 │       ├── app.py          # FastAPI 入口
 │       └── schemas.py      # Pydantic 模型
 ├── ui/
-│   └── app.py              # Streamlit 界面
 ├── data/                   # 示例文档目录
 ├── config/
 │   └── settings.py         # 配置中心（环境变量）
@@ -166,7 +165,7 @@ nexus-rag/
 | Rerank | BAAI/bge-reranker-v2-m3 | 中文效果好，开源 |
 | 文档解析 | pymupdf / unstructured | 支持 PDF/MD/TXT |
 | 服务层 | FastAPI | 异步、自动文档 |
-| UI | Streamlit | 快速原型，交互式演示 |
+| UI | Next.js | React + TypeScript，生产级前端 |
 | 评估 | RAGAS | faithfulness / answer_relevancy 指标 |
 
 ---
@@ -228,7 +227,7 @@ uv add langchain langchain-community langgraph chromadb \
 | Phase 1 | 基础 RAG：Chroma + Embedding + 简单检索 | 能跑通端到端流程 |
 | Phase 2 | 混合检索 + Rerank | 提升召回质量 |
 | Phase 3 | LangGraph 编排 + Query Rewrite | 引入多步推理能力 |
-| Phase 4 | FastAPI + Streamlit UI | 提供可交互的服务 |
+| Phase 4 | FastAPI + Next.js UI | 提供可交互的服务 |
 | Phase 5 | RAGAS 评估 | 量化回答质量 |
 
 > 各阶段的具体做法与 AI 辅助学习方法，见 [docs/learning-path.md](docs/learning-path.md)。

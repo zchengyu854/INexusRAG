@@ -20,13 +20,9 @@ case "${1:-all}" in
     npm run dev
     ;;
   all)
-    # 启动后端
     echo "🚀 启动后端 :8000 ..."
-    cd "$(dirname "$0")"
     uv run uvicorn src.api.app:app --reload --port 8000 &
     PID_BACKEND=$!
-
-    # 启动前端
     echo "🎨 启动前端 :3000 ..."
     cd ui/web
     npm run dev &

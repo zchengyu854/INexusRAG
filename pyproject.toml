@@ -18,10 +18,6 @@ dependencies = [
     "chromadb>=1.0",
 ]
 
-[[project.scripts]]
-name = "serve"
-code = "src.api.app:app"
-
-[[project.scripts]]
-name = "ui"
-code = "ui.app:main"
+[project.scripts]
+serve = "src.api.app:app"
+ui = "ui.app:main"
