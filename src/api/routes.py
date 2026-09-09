@@ -24,7 +24,7 @@ from src.api.schemas import (
 from src.ingestion.embedder import get_embedder
 from src.ingestion.splitter import split_document
 from src.llm.client import get_llm
-from src.retrieval import extract_terms, index_document_route, two_stage_search
+from src.retrieval import index_document_route, multi_query_search
 from src.storage.database import (
     create_document,
     delete_document as delete_document_record,
@@ -321,8 +321,7 @@ def query(request: QueryRequest):
             conversation_id=conversation_id,
         )
 
-    query_embedding = get_embedder().encode([request.question])[0]
-    results = two_stage_search(query_embedding, top_k=request.top_k, terms=extract_terms(request.question), filters=request.filters)
+    results = multi_query_search(request.question, top_k=request.top_k, filters=request.filters)
     if not results:
         answer = "未检索到相关内容，请先上传并入库文档。"
         save_message(conversation_id, "assistant", answer)

@@ -1,3 +1,4 @@
+import types
 import unittest
 
 from unittest.mock import patch
@@ -5,6 +6,8 @@ from unittest.mock import patch
 from src.retrieval import (
     build_routing_summary,
     extract_terms,
+    multi_query_search,
+    plan_question,
     rrf_merge,
     two_stage_search,
 )
@@ -12,6 +15,60 @@ from src.retrieval import (
 
 def row(cid, score=0.9):
     return {"chunk_id": cid, "score": score}
+
+
+class _FakePlanLLM:
+    enabled = True
+
+    def __init__(self, payload: str):
+        self.model = "fake"
+        self._payload = payload
+
+    def _get_client(self):
+        message = types.SimpleNamespace(content=self._payload)
+        choice = types.SimpleNamespace(message=message)
+        response = types.SimpleNamespace(choices=[choice])
+        create = types.SimpleNamespace(create=lambda **kwargs: response)
+        return types.SimpleNamespace(chat=types.SimpleNamespace(completions=create))
+
+
+_EMPTY_PLAN = {"subs": [], "step_back": None, "hyde": None}
+
+
+class PlanTests(unittest.TestCase):
+    def test_disabled_llm_returns_empty_plan(self):
+        with patch("src.llm.client.get_llm", return_value=types.SimpleNamespace(enabled=False)):
+            self.assertEqual(plan_question("什么是 RAG"), _EMPTY_PLAN)
+
+    def test_plan_parses_all_three_fields(self):
+        llm = _FakePlanLLM(
+            '{"subs": ["RAG 是什么", "向量库怎么选型"], '
+            '"step_back": "检索系统如何提高召回率", '
+            '"hyde": "本文档讨论了检索与增强的关系，包含向量检索、关键词匹配以及上下文组装等关键环节，并比较了不同召回策略的优缺点……"}'
+        )
+        with patch("src.llm.client.get_llm", return_value=llm):
+            plan = plan_question("复杂问题")
+        self.assertEqual(plan["subs"], ["RAG 是什么", "向量库怎么选型"])
+        self.assertEqual(plan["step_back"], "检索系统如何提高召回率")
+        self.assertIn("向量检索", plan["hyde"])
+
+    def test_plan_ignores_degenerate_fields(self):
+        llm = _FakePlanLLM('{"subs": ["", "  "], "step_back": "短", "hyde": "太短"}')
+        with patch("src.llm.client.get_llm", return_value=llm):
+            self.assertEqual(plan_question("问题"), _EMPTY_PLAN)
+
+    def test_malformed_llm_output_falls_back_to_empty(self):
+        llm = _FakePlanLLM("我不太会输出 JSON")
+        with patch("src.llm.client.get_llm", return_value=llm):
+            self.assertEqual(plan_question("复杂问题"), _EMPTY_PLAN)
+
+    def test_llm_failure_returns_empty_plan(self):
+        class _BrokenLLM:
+            enabled = True
+            def _get_client(self):
+                raise RuntimeError("api down")
+        with patch("src.llm.client.get_llm", return_value=_BrokenLLM()):
+            self.assertEqual(plan_question("问题"), _EMPTY_PLAN)
 
 
 class RetrievalTests(unittest.TestCase):
@@ -82,6 +139,46 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(summary.count("## 安装"), 1)
         self.assertNotIn("### 验证", summary)
         self.assertLess(len(summary), 320)
+
+    def test_multi_query_search_merges_subquestion_channels(self):
+        def fake_tss(vec, top_k, terms, filters=None):
+            return [{"chunk_id": f"c-{i}", "text": f"{terms}-{i}"} for i in range(top_k)]
+
+        plan = {"subs": ["子问题 A", "子问题 B"], "step_back": None, "hyde": None}
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss) as tss_mock, \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.return_value = [[0.0]] * 3
+            results = multi_query_search("原始问题", top_k=2, filters={"page": 1})
+
+        self.assertEqual(len(tss_mock.call_args_list), 3)  # 原问题 + 两个子问题
+        self.assertTrue(all(c.kwargs.get("filters") == {"page": 1} for c in tss_mock.call_args_list))
+        ids = [r["chunk_id"] for r in results]
+        self.assertEqual(len(set(ids)), len(ids))  # RRF 按 chunk_id 去重
+
+    def test_multi_query_search_full_plan_gives_four_channels(self):
+        plan = {
+            "subs": ["子问题 A"],
+            "step_back": "抽象概念问题",
+            "hyde": "假想文档段落，足够长能通过长度校验",
+        }
+        with patch("src.retrieval.two_stage_search", return_value=[]) as tss_mock, \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            multi_query_search("原始问题", top_k=2)
+        # 原问题 + 子问题 + 退步 + HyDE(纯向量, terms=[]) = 4 通道
+        self.assertEqual(len(tss_mock.call_args_list), 4)
+        self.assertEqual(tss_mock.call_args_list[3].kwargs["terms"], [])
+
+    def test_multi_query_search_empty_plan_is_single_channel(self):
+        with patch("src.retrieval.two_stage_search", return_value=[]) as tss_mock, \
+             patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.return_value = [[0.0]]
+            multi_query_search("简单问题", top_k=2)
+        # 门控：LLM 判定不需要分解/退步/HyDE → 仅原问题单通道
+        self.assertEqual(len(tss_mock.call_args_list), 1)
 
 
 if __name__ == "__main__":
