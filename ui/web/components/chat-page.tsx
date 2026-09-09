@@ -1,19 +1,13 @@
 "use client"
 
 import { useState, useRef, useEffect } from "react"
-import { queryDoc } from "@/lib/api"
+import { clearConversation, getConversationMessages, getConversations, queryDoc, type ConversationSummary, type Source } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Send, Bot, User, FileText, Search, Loader2, AlertCircle } from "lucide-react"
-
-interface Source {
-  doc_name: string
-  text: string
-  score: number
-}
+import { Send, Bot, User, FileText, Search, Loader2, AlertCircle, Trash2, Plus, MessageSquare } from "lucide-react"
 
 interface Message {
   id: string
@@ -23,7 +17,24 @@ interface Message {
   timestamp: Date
 }
 
+const CONVERSATION_KEY = "nexus-rag-conversation-id"
+
+function getConversationId() {
+  const existing = window.localStorage.getItem(CONVERSATION_KEY)
+  if (existing) return existing
+  const id = crypto.randomUUID()
+  window.localStorage.setItem(CONVERSATION_KEY, id)
+  return id
+}
+
+function toMessage(message: { id: string; role: "user" | "assistant"; content: string; sources: Source[]; created_at: string }): Message {
+  return { ...message, timestamp: new Date(message.created_at) }
+}
+
 export function ChatPage() {
+  const conversationIdRef = useRef<string | null>(null)
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null)
+  const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
@@ -31,6 +42,21 @@ export function ChatPage() {
   const [progress, setProgress] = useState(0)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const conversationId = getConversationId()
+    conversationIdRef.current = conversationId
+    Promise.all([getConversations(), getConversationMessages(conversationId)]).then(([items, history]) => {
+      if (cancelled) return
+      setSelectedConversationId(conversationId)
+      setConversations(items)
+      setMessages(history.map(toMessage))
+    }).catch((e) => {
+      if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load conversation")
+    })
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -44,9 +70,40 @@ export function ChatPage() {
     el.style.height = Math.min(el.scrollHeight, 200) + "px"
   }, [input])
 
+  async function selectConversation(id: string) {
+    if (loading || id === conversationIdRef.current) return
+    setError(null)
+    try {
+      const history = await getConversationMessages(id)
+      conversationIdRef.current = id
+      setSelectedConversationId(id)
+      window.localStorage.setItem(CONVERSATION_KEY, id)
+      setMessages(history.map(toMessage))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load conversation")
+    }
+  }
+
+  function newConversation() {
+    if (loading) return
+    const id = crypto.randomUUID()
+    conversationIdRef.current = id
+    setSelectedConversationId(id)
+    window.localStorage.setItem(CONVERSATION_KEY, id)
+    setMessages([])
+    setError(null)
+  }
+
+  async function refreshConversations() {
+    setConversations(await getConversations())
+  }
+
   async function handleSend() {
     const question = input.trim()
     if (!question || loading) return
+
+    if (!conversationIdRef.current) return
+    const conversationId = conversationIdRef.current
 
     const userMsg: Message = {
       id: Date.now().toString(),
@@ -66,7 +123,7 @@ export function ChatPage() {
     }, 300)
 
     try {
-      const result = await queryDoc(question)
+      const result = await queryDoc(question, conversationId)
       clearInterval(progressInterval)
       setProgress(100)
 
@@ -78,12 +135,26 @@ export function ChatPage() {
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, assistantMsg])
+      await refreshConversations()
     } catch (e) {
       setError(e instanceof Error ? e.message : "Query failed")
     } finally {
       clearInterval(progressInterval)
       setLoading(false)
       setProgress(0)
+    }
+  }
+
+  async function handleClear() {
+    if (!conversationIdRef.current || loading) return
+    const conversationId = conversationIdRef.current
+    try {
+      await clearConversation(conversationId)
+      setMessages([])
+      setConversations((items) => items.filter((item) => item.id !== conversationId))
+      setError(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to clear conversation")
     }
   }
 
@@ -95,18 +166,43 @@ export function ChatPage() {
   }
 
   return (
-    <div className="flex flex-col h-[calc(100vh-13rem)]">
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 space-y-6">
-        {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center space-y-4">
-            <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
-              <Bot className="w-8 h-8 text-primary" />
+    <div className="flex h-full min-h-0 gap-0 overflow-hidden rounded-lg border bg-card">
+      <aside className="hidden w-64 shrink-0 border-r bg-muted/20 md:flex md:flex-col">
+        <div className="flex items-center justify-between border-b p-3">
+          <span className="text-sm font-medium">History</span>
+          <Button variant="ghost" size="icon" onClick={newConversation} disabled={loading} title="New conversation">
+            <Plus className="size-4" />
+          </Button>
+        </div>
+        <div className="flex-1 space-y-1 overflow-y-auto p-2">
+          {conversations.map((conversation) => (
+            <button
+              key={conversation.id}
+              onClick={() => selectConversation(conversation.id)}
+              className={`w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-muted ${conversation.id === selectedConversationId ? "bg-muted font-medium" : ""}`}
+            >
+              <div className="flex items-start gap-2">
+                <MessageSquare className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <span className="line-clamp-2 break-words">{conversation.title}</span>
+              </div>
+              <span className="ml-6 text-xs text-muted-foreground">{conversation.message_count} messages</span>
+            </button>
+          ))}
+          {conversations.length === 0 && <p className="p-2 text-xs text-muted-foreground">No saved conversations</p>}
+        </div>
+      </aside>
+
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* Messages */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
+          <div className="mx-auto max-w-3xl space-y-6">
+        {messages.length === 0 && !loading && !error && (
+          <div className="flex h-[calc(100vh-24rem)] flex-col items-center justify-center text-center">
+            <div className="mb-4 flex size-16 items-center justify-center rounded-full bg-primary/10">
+              <Bot className="size-8 text-primary" />
             </div>
-            <div>
-              <h2 className="text-xl font-semibold">Ask anything about your documents</h2>
-              <p className="text-muted-foreground mt-1">Upload documents first, then ask questions to get answers from your knowledge base.</p>
-            </div>
+            <h2 className="text-lg font-semibold">Ask anything about your documents</h2>
+            <p className="mt-2 max-w-md text-muted-foreground">Upload documents first, then ask questions to get grounded answers from your knowledge base.</p>
           </div>
         )}
 
@@ -117,9 +213,9 @@ export function ChatPage() {
         {loading && (
           <div className="space-y-2">
             <div className="flex items-start gap-3">
-              <Avatar className="w-8 h-8 mt-1">
+              <Avatar className="size-8 mt-1">
                 <AvatarFallback className="bg-primary/10">
-                  <Bot className="w-4 h-4 text-primary" />
+                  <Bot className="size-4 text-primary" />
                 </AvatarFallback>
               </Avatar>
               <div className="flex-1 space-y-2">
@@ -133,9 +229,9 @@ export function ChatPage() {
 
         {error && (
           <div className="flex items-start gap-3">
-            <Avatar className="w-8 h-8 mt-1">
+            <Avatar className="size-8 mt-1">
               <AvatarFallback className="bg-destructive/10">
-                <AlertCircle className="w-4 h-4 text-destructive" />
+                <AlertCircle className="size-4 text-destructive" />
               </AvatarFallback>
             </Avatar>
             <Card className="border-destructive/50">
@@ -147,11 +243,19 @@ export function ChatPage() {
         )}
 
         <div ref={bottomRef} />
-      </div>
+          </div>
+        </div>
 
-      {/* Input */}
-      <div className="border-t bg-card p-4">
-        <div className="max-w-3xl mx-auto flex gap-2">
+        {/* Input */}
+      <div className="shrink-0 border-t bg-card p-4">
+        <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
+          <span className="text-xs text-muted-foreground">Saved to database</span>
+          <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
+            <Trash2 className="size-4 mr-1" />
+            Clear
+          </Button>
+        </div>
+        <div className="mx-auto flex max-w-3xl gap-2">
           <textarea
             ref={inputRef}
             value={input}
@@ -163,10 +267,11 @@ export function ChatPage() {
             disabled={loading}
           />
           <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg">
-            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
+            {loading ? <Loader2 className="size-5 animate-spin" /> : <Send className="size-5" />}
           </Button>
         </div>
       </div>
+      </section>
     </div>
   )
 }
@@ -212,6 +317,12 @@ function SourceChip({ source }: { source: Source }) {
     <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-muted/50 text-xs hover:bg-muted transition-colors cursor-pointer">
       <FileText className="w-3 h-3 text-muted-foreground shrink-0" />
       <span className="font-medium truncate">{source.doc_name}</span>
+      {source.chunk_index != null && (
+        <span className="text-muted-foreground shrink-0">#{source.chunk_index}</span>
+      )}
+      {source.page != null && (
+        <span className="text-muted-foreground shrink-0">p.{source.page}</span>
+      )}
       {source.score != null && (
         <span className="ml-auto text-muted-foreground shrink-0">
           {source.score.toFixed(2)}

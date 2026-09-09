@@ -71,7 +71,8 @@ class Embedder:
             raise ImportError("使用本地 embedding 需要安装 sentence-transformers: uv add sentence-transformers")
 
         model_name = _get_env("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3")
-        return SentenceTransformer(model_name)
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        return SentenceTransformer(model_name, local_files_only=True)
 
     def encode(self, texts: Iterable[str], batch_size: int = 32) -> list[list[float]]:
         """

@@ -1,23 +1,19 @@
 [project]
 name = "nexus-rag"
 version = "0.1.0"
-description = "多文档智能问答系统 — 学习路径用 FastAPI + Streamlit 模板"
+description = "多文档智能问答系统 — FastAPI + PostgreSQL/pgvector + Next.js"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    "aiofiles>=24",
     "python-multipart>=0.0.18",
-    "streamlit>=1.40",
     "requests>=2.32",
     "python-dotenv>=1.0",
     "openai>=1.0",
     "sentence-transformers>=3.0",
     "pymupdf>=1.24",
-    "markdown>=3.5",
-    "chromadb>=1.0",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]
 serve = "src.api.app:app"
-ui = "ui.app:main"

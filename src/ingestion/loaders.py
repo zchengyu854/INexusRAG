@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
 
-import markdown
 import pymupdf  # fitz
 
 
@@ -15,40 +13,54 @@ def _clean(text: str) -> str:
     return text.strip()
 
 
+def load_pdf_pages(path: Path | str) -> list[tuple[int, str]]:
+    """Extract layout blocks page by page, retaining the original 1-based page number."""
+    pages: list[tuple[int, str]] = []
+    with pymupdf.open(path) as doc:
+        for page_number, page in enumerate(doc, start=1):
+            blocks: list[str] = []
+            for block in page.get_text("blocks", sort=True):
+                text = _clean(block[4])
+                if text:
+                    blocks.append(text)
+            if blocks:
+                pages.append((page_number, "\n\n".join(blocks)))
+    return pages
+
+
 def load_pdf(path: Path | str) -> str:
-    """提取 PDF 全文，含换行保留段落结构。"""
-    doc = pymupdf.open(path)
-    parts: list[str] = []
-    for page in doc:
-        text = page.get_text("text")
-        if text.strip():
-            parts.append(_clean(text))
-    return "\n\n".join(parts)
+    """Extract PDF text while preserving page and layout-block separators."""
+    return "\n\f\n".join(text for _, text in load_pdf_pages(path))
 
 
 def load_md(path: Path | str) -> str:
-    """解析 Markdown 为纯文本（标题/列表转行，图片 alt 保留）。"""
+    """读取 Markdown，保留标题、段落、列表和代码围栏供切片器处理。"""
     raw = Path(path).read_text(encoding="utf-8")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Markdown 图片：[alt](url) → [alt]，保留关键信息
-    raw = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"[*\1*]", raw)
-    # 删除链接括号但保留链接文字：[text](url) → text
-    raw = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", raw)
-    # 删除 HTML 标签
-    raw = re.sub(r"<[^>]+>", "", raw)
-    # Markdown → HTML → plain text（保留段落结构）
-    html = markdown.markdown(raw, extensions=["tables"])
-    # 简化 HTML 标签为换行/空格
-    html = re.sub(r"<h[1-6][^>]*>", "\n## ", html)
-    html = re.sub(r"</h[1-6][^>]*>", "\n", html)
-    html = re.sub(r"<p[^>]*>", "\n", html)
-    html = re.sub(r"</p>", "\n", html)
-    html = re.sub(r"<li[^>]*>", "- ", html)
-    html = re.sub(r"</li>", "\n", html)
-    html = re.sub(r"<br\s*/?>", "\n", html)
-    html = re.sub(r"<[^>]+>", "", html)
+    lines: list[str] = []
+    in_fence = False
+    fence_char = ""
+    for line in raw.split("\n"):
+        fence = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not in_fence:
+                in_fence = True
+                fence_char = marker[0]
+            elif marker[0] == fence_char:
+                in_fence = False
+            lines.append(line)
+            continue
+        if not in_fence:
+            line = re.sub(r"<img\b[^>]*>", "", line, flags=re.IGNORECASE)
+            line = re.sub(r"</?[^>]+>", "", line)
+        lines.append(line)
 
-    return _clean(html)
+    text = "\n".join(lines)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def load_txt(path: Path | str) -> str:

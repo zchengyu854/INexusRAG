@@ -30,6 +30,7 @@ Thumbs.db
 
 # Data (may contain sensitive test/sample data)
 data/chroma/
+data/uploads/
 data/*.json
 data/test_docs/
 docs/*

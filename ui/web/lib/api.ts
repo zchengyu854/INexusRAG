@@ -1,29 +1,72 @@
 "use client"
 
 import { API_BASE } from "./constants"
-import { useState, useEffect } from "react"
 
-interface Doc {
+export interface ChatMessage {
+  id: string
+  role: "user" | "assistant"
+  content: string
+  sources: Source[]
+  created_at: string
+}
+
+export interface ConversationSummary {
+  id: string
+  title: string
+  message_count: number
+  updated_at: string
+}
+
+export interface Doc {
   id: string
   filename: string
   chunks: number
   status: string
 }
 
-interface Chunk {
+export interface Chunk {
   index: number
   chunk_id: string
   text: string
   length: number
   overlap_with_next: number
+  page?: number
 }
 
-interface DocConfig {
+export interface DocConfig {
   strategy: string
   chunk_size: number
   chunk_overlap: number
   embedding_model: string
   embedding_dimension: number
+}
+
+export interface Source {
+  doc_name: string
+  chunk_index?: number
+  page?: number
+  text: string
+  score?: number
+}
+
+export interface PreviewResult {
+  total_chunks: number
+  chunks: Chunk[]
+}
+
+export interface RechunkResult {
+  success: boolean
+  old_chunks: number
+  new_chunks: number
+  latency_ms: number
+  error?: string
+}
+
+export interface Stats {
+  total_documents: number
+  total_chunks: number
+  embedding_dimension: number
+  total_size_kb: number
 }
 
 interface ChunkDetail {
@@ -80,7 +123,7 @@ export async function getDocDetail(docId: string): Promise<ChunkDetail> {
   return res.json()
 }
 
-export async function previewRechunk(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<{ total_chunks: number; chunks: Chunk[] }> {
+export async function previewRechunk(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<PreviewResult> {
   const res = await fetch(`${API_BASE}/documents/${docId}/preview`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -88,7 +131,7 @@ export async function previewRechunk(docId: string, params: { chunk_size: number
   })
   if (!res.ok) throw new Error("Preview failed")
   const data = await res.json()
-  return { total_chunks: data.total_chunks, chunks: data.chunks.slice(0, 10) }
+  return { total_chunks: data.total_chunks, chunks: data.chunks }
 }
 
 export async function rechunkDocument(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<{
@@ -112,17 +155,34 @@ export async function deleteDocument(docId: string): Promise<void> {
   if (!res.ok) throw new Error("Delete failed")
 }
 
-export async function queryDoc(question: string, topK = 5): Promise<{ answer: string; sources: any[] }> {
+export async function getConversations(): Promise<ConversationSummary[]> {
+  const res = await fetch(`${API_BASE}/conversations`)
+  if (!res.ok) throw new Error("Failed to fetch conversations")
+  return res.json()
+}
+
+export async function queryDoc(question: string, conversationId: string, topK = 5): Promise<{ answer: string; sources: Source[]; conversation_id: string }> {
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, stream: false, top_k: topK }),
+    body: JSON.stringify({ question, conversation_id: conversationId, stream: false, top_k: topK }),
   })
   if (!res.ok) throw new Error("Query failed")
   return res.json()
 }
 
-export async function getStats(): Promise<{ total_documents: number; total_chunks: number; embedding_dimension: number; total_size_kb: number }> {
+export async function getConversationMessages(conversationId: string): Promise<ChatMessage[]> {
+  const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(conversationId)}/messages`)
+  if (!res.ok) throw new Error("Failed to fetch conversation")
+  return res.json()
+}
+
+export async function clearConversation(conversationId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/conversations/${encodeURIComponent(conversationId)}/messages`, { method: "DELETE" })
+  if (!res.ok) throw new Error("Failed to clear conversation")
+}
+
+export async function getStats(): Promise<Stats> {
   const res = await fetch(`${API_BASE}/stats`)
   if (!res.ok) throw new Error("Failed to fetch stats")
   return res.json()

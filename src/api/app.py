@@ -1,13 +1,24 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import router
 from src.api.schemas import HealthResponse
+from src.storage.database import ensure_database
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_database()
+    yield
+
 
 app = FastAPI(
     title="NexusRAG",
     description="多文档智能问答系统 — 学习路径用 FastAPI 后端模板",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

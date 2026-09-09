@@ -1,10 +1,11 @@
+import { MessageCircle, Files, Network } from "lucide-react"
 import { DocumentList } from "@/components/document-list"
 import { ChatPage } from "@/components/chat-page"
-import { getStats } from "@/lib/api"
+import { getStats, type Stats } from "@/lib/api"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
 export default async function Home() {
-  let stats: any = null
+  let stats: Stats | null = null
   try {
     stats = await getStats()
   } catch {
@@ -12,61 +13,47 @@ export default async function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-background">
-      {/* Header */}
+    <main className="flex h-dvh flex-col overflow-hidden bg-muted/30">
       <header className="border-b bg-card">
-        <div className="max-w-6xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold">NexusRAG</h1>
-            <p className="text-sm text-muted-foreground">Multi-document intelligent Q&A system</p>
+        <div className="mx-auto flex w-full max-w-[1440px] items-center justify-between gap-6 px-6 py-5">
+          <div className="flex items-center gap-3">
+            <div className="flex size-10 items-center justify-center rounded-xl bg-primary text-primary-foreground">
+              <Network className="size-5" />
+            </div>
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight">NexusRAG</h1>
+              <p className="text-sm text-muted-foreground">Multi-document intelligent Q&A system</p>
+            </div>
           </div>
           {stats && (
-            <div className="flex gap-4 text-sm text-muted-foreground">
-              <span><strong className="text-foreground">{stats.total_documents}</strong> docs</span>
+            <div className="hidden items-center gap-5 text-sm text-muted-foreground sm:flex">
+              <span><strong className="text-foreground">{stats.total_documents}</strong> documents</span>
               <span><strong className="text-foreground">{stats.total_chunks}</strong> chunks</span>
             </div>
           )}
         </div>
       </header>
 
-      {/* Content */}
-      <div className="max-w-6xl mx-auto px-4 py-6 w-full">
-        <Tabs defaultValue="chat" className="w-full">
-          <TabsList className="mb-6">
+      <div className="mx-auto flex min-h-0 w-full max-w-[1440px] flex-1 px-6 py-6">
+        <Tabs defaultValue="chat" className="flex h-full min-h-0 w-full flex-col">
+          <TabsList className="mb-5 self-start">
             <TabsTrigger value="chat">
-              <ChatIcon /> Chat
+              <MessageCircle /> Chat
             </TabsTrigger>
             <TabsTrigger value="documents">
-              <DocsIcon /> Documents
+              <Files /> Documents
             </TabsTrigger>
           </TabsList>
 
-          <TabsContent value="chat" className="mt-0">
+          <TabsContent value="chat" className="mt-0 min-h-0 overflow-hidden">
             <ChatPage />
           </TabsContent>
 
-          <TabsContent value="documents" className="mt-0">
+          <TabsContent value="documents" className="mt-0 min-h-0 overflow-y-auto">
             <DocumentList />
           </TabsContent>
         </Tabs>
       </div>
     </main>
-  )
-}
-
-function ChatIcon() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mr-2">
-      <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/>
-    </svg>
-  )
-}
-
-function DocsIcon() {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mr-2">
-      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>
-      <polyline points="14 2 14 8 20 8"/>
-    </svg>
   )
 }

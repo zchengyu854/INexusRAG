@@ -1,8 +1,7 @@
 "use client"
 
 import React from "react"
-import { useState, useEffect } from "react"
-import { API_BASE } from "@/lib/constants"
+import { useState, useEffect, useCallback } from "react"
 import { fetchDocs, uploadFile, ingestDocument, deleteDocument } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -24,11 +23,7 @@ export function DocumentList() {
   const [error, setError] = useState<string | null>(null)
   const [selectedDoc, setSelectedDoc] = useState<Doc | null>(null)
 
-  useEffect(() => {
-    loadDocs()
-  }, [])
-
-  async function loadDocs() {
+  const loadDocs = useCallback(async () => {
     try {
       const data = await fetchDocs()
       setDocs(data)
@@ -36,7 +31,18 @@ export function DocumentList() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load documents")
     }
-  }
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadDocs() }, 0)
+    return () => window.clearTimeout(timer)
+  }, [loadDocs])
+
+  useEffect(() => {
+    if (!docs.some((doc) => doc.status === "indexing")) return
+    const timer = window.setInterval(loadDocs, 1500)
+    return () => window.clearInterval(timer)
+  }, [docs, loadDocs])
 
   async function handleUpload(file: File) {
     setUploading(true)
@@ -144,7 +150,7 @@ function UploadButton({ onUpload, loading }: { onUpload: (file: File) => void; l
         }}
       />
       <Button onClick={() => inputRef.current?.click()} disabled={loading}>
-        {loading ? "Uploading..." : "+ Upload Document"}
+        {loading ? "Uploading file..." : "+ Upload Document"}
       </Button>
     </>
   )

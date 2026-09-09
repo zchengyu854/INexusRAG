@@ -1,34 +1,53 @@
+"""Markdown-aware semantic text splitting for RAG ingestion."""
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
-from src.ingestion.loaders import load
+from src.ingestion.loaders import load, load_pdf_pages
 
 
 @dataclass
 class Chunk:
     """切片单元。"""
+
     text: str
     chunk_id: str  # "{doc_name}-{index}"
     doc_name: str
     metadata: dict | None = None
 
 
+@dataclass
+class _Block:
+    text: str
+    kind: Literal["prose", "list", "code"]
+
+
+@dataclass
+class _Section:
+    heading_path: tuple[str, ...]
+    blocks: list[_Block] = field(default_factory=list)
+
+
 class TextSplitter:
     """
-    核心算法：分隔符按语义重量排优先级回退
-    fence > 标题 > 空行 > 句子 > 字符
+    Markdown-aware semantic splitter.
 
-    1. ``` 预切分成 [prose, code, ...] 交替序列，代码块为原子单元（记 lang 元数据）
-    2. prose 按标题切 section（标题归属内容，不独立成块）
-    3. section 按空行切段落
-    4. 贪心装箱：单元永不跨箱
-    5. 超限单元降级：代码块按空行/行组切，段落回退 sentence
-    6. overlap 用单元级（新块带前块最后一个单元），不用字符级
-    7. 短尾块并入前块，不丢弃
+    Priority is: fenced code > heading section > blank-line block > sentence >
+    character fallback. Heading paths are repeated in each chunk of a section
+    so a retrieved chunk keeps its document context.
     """
+
+    _heading_re = re.compile(r"^\s{0,3}(#{1,6})[ \t]+(.+?)\s*$")
+    _setext_re = re.compile(r"^\s*(=+|-+)\s*$")
+    _horizontal_rule_re = re.compile(r"^\s{0,3}(?:-{3,}|\*\s*\*\s*\*|_{3,})\s*$")
+    _fence_open_re = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
+    _list_item_re = re.compile(r"^\s*(?:[-+*]|\d+[.)])[ \t]+")
+    _sentence_re = re.compile(
+        r"(?<=[。！？!?])\s*|(?<=[.!?])\s+(?=[A-Za-z0-9\u4e00-\u9fff])"
+    )
 
     def __init__(
         self,
@@ -37,12 +56,16 @@ class TextSplitter:
         strategy: Literal["recursive", "sentence"] = "recursive",
         min_chunk_size: int = 64,
     ):
-        if chunk_overlap >= chunk_size:
+        if chunk_size < 1:
+            raise ValueError("chunk_size 必须大于 0")
+        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
             raise ValueError("chunk_overlap 必须小于 chunk_size")
-        if chunk_size < min_chunk_size:
-            raise ValueError(f"chunk_size 不能小于 {min_chunk_size}")
+        if min_chunk_size < 1:
+            raise ValueError("min_chunk_size 必须大于 0")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
+        # Kept for API compatibility. Both historical strategies now use the
+        # same Markdown-aware semantic rules.
         self.strategy = strategy
         self.min_chunk_size = min_chunk_size
 
@@ -50,218 +73,212 @@ class TextSplitter:
         if not text.strip():
             return []
 
-        # Step 1: fence 预切分 → [prose, code, ...] 交替序列
-        segments = self._split_by_fences(text)
-
-        # Step 2-3: prose 按标题切 section，再按空行切段落；代码块保持原子
-        units: list[dict] = []  # [{"text": ..., "type": "prose"|"code", "meta": ...}]
-        for seg_type, seg_content, seg_meta in segments:
-            if seg_type == "code":
-                units.append({"text": seg_content, "type": "code", "meta": seg_meta})
-            else:
-                for section in self._split_prose_by_headings(seg_content):
-                    for para in self._split_by_paragraphs(section):
-                        if para.strip():
-                            units.append({"text": para, "type": "prose", "meta": None})
-
-        # Step 5: 超限单元降级 —— 代码块按空行/行组切，段落回退 sentence
-        degraded: list[dict] = []
-        for u in units:
-            if len(u["text"]) <= self.chunk_size:
-                degraded.append(u)
-            elif u["type"] == "code":
-                degraded.extend(self._degrade_code(u["text"], u["meta"]))
-            else:
-                degraded.extend(self._degrade_paragraph(u["text"]))
-
-        # Step 4: 贪心装箱
-        chunks = self._greedy_pack(degraded)
-
-        # Step 7: 短尾块并入前块（在 overlap 之前，避免短块被 overlap 膨胀后跳过合并）
-        chunks = self._merge_short_tail(chunks)
-
-        # Step 6: 单元级 overlap
-        chunks = self._apply_overlap(chunks)
-
-        # 生成最终 Chunk 对象
         result: list[Chunk] = []
-        for i, c in enumerate(chunks):
-            text = c.strip()
-            if not text:
+        for section in self._parse_sections(text):
+            for section_text in self._split_section(section):
+                section_text = section_text.strip()
+                if not section_text:
+                    continue
+                result.append(
+                    Chunk(
+                        text=section_text,
+                        chunk_id=f"{doc_name}-{len(result)}",
+                        doc_name=doc_name,
+                        metadata={"heading_path": list(section.heading_path)},
+                    )
+                )
+        return result
+
+    def _parse_sections(self, text: str) -> list[_Section]:
+        """Parse fenced code and headings before applying content split rules."""
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        sections: list[_Section] = []
+        current = _Section(())
+        sections.append(current)
+        heading_stack: list[tuple[int, str]] = []
+        text_buffer: list[str] = []
+
+        def append_block(block: _Block) -> None:
+            if current.blocks and block.kind == "list" and current.blocks[-1].kind == "list":
+                current.blocks[-1].text += "\n" + block.text
+            else:
+                current.blocks.append(block)
+
+        def flush_text() -> None:
+            if not text_buffer:
+                return
+            block_text = "\n".join(text_buffer).strip()
+            text_buffer.clear()
+            if not block_text:
+                return
+            kind: Literal["prose", "list"] = (
+                "list" if self._list_item_re.match(block_text) else "prose"
+            )
+            append_block(_Block(block_text, kind))
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            heading = self._heading_re.match(line)
+            setext = (
+                not heading
+                and line.strip()
+                and not self._list_item_re.match(line)
+                and i + 1 < len(lines)
+                and self._setext_re.match(lines[i + 1])
+            )
+            if heading or setext:
+                flush_text()
+                if heading:
+                    level = len(heading.group(1))
+                    title_text = heading.group(2).strip()
+                    i += 1
+                else:
+                    level = 1 if lines[i + 1].lstrip().startswith("=") else 2
+                    title_text = line.strip()
+                    i += 2
+                title = f"{'#' * level} {title_text}"
+                while heading_stack and heading_stack[-1][0] >= level:
+                    heading_stack.pop()
+                heading_stack.append((level, title))
+                current = _Section(tuple(item[1] for item in heading_stack))
+                sections.append(current)
                 continue
-            result.append(Chunk(
-                text=text,
-                chunk_id=f"{doc_name}-{i}",
-                doc_name=doc_name,
-            ))
-        return result
 
-    # ── Step 1: fence 预切分 ──────────────────────────────────
+            if self._horizontal_rule_re.match(line):
+                flush_text()
+                i += 1
+                continue
 
-    _fence_re = re.compile(r"^(```[\w+-]*\s*\n.*?\n```)", re.MULTILINE | re.DOTALL)
+            fence = self._fence_open_re.match(line)
+            if fence:
+                flush_text()
+                marker = fence.group(1)
+                fence_char = marker[0]
+                fence_size = len(marker)
+                code_lines = [line]
+                i += 1
+                while i < len(lines):
+                    code_lines.append(lines[i])
+                    closing = re.match(
+                        rf"^\s*{re.escape(fence_char)}{{{fence_size},}}\s*$",
+                        lines[i],
+                    )
+                    i += 1
+                    if closing:
+                        break
+                append_block(_Block("\n".join(code_lines).strip(), "code"))
+                continue
 
-    def _split_by_fences(self, text: str) -> list[tuple[str, str, dict | None]]:
-        """返回 [(type, content, meta), ...]，type = "prose"|"code"。"""
-        result: list[tuple[str, str, dict | None]] = []
-        last_end = 0
-        for m in self._fence_re.finditer(text):
-            # fence 之前的 prose
-            if m.start() > last_end:
-                result.append(("prose", text[last_end:m.start()], None))
-            fence_block = m.group(1)
-            # 提取语言标记
-            first_line = fence_block.split("\n", 1)[0]
-            lang = first_line[3:].strip() or None
-            result.append(("code", fence_block, {"lang": lang}))
-            last_end = m.end()
-        # 剩余 prose
-        if last_end < len(text):
-            result.append(("prose", text[last_end:], None))
-        return result
-
-    # ── Step 2: prose 按标题切 section ────────────────────────
-
-    _heading_re = re.compile(r"^(#{1,6}\s+.+)$", re.MULTILINE)
-
-    def _split_prose_by_headings(self, text: str) -> list[str]:
-        """标题归属后续内容，不独立成块。"""
-        parts = self._heading_re.split(text)
-        sections: list[str] = []
-        buf = ""
-        for p in parts:
-            if self._heading_re.match(p):
-                # 遇到新标题，把之前的 buf 存下
-                if buf.strip():
-                    sections.append(buf)
-                buf = p  # 标题作为新 section 的开头
+            if not line.strip():
+                flush_text()
             else:
-                buf += p
-        if buf.strip():
-            sections.append(buf)
-        return sections if sections else [text]
+                text_buffer.append(line)
+            i += 1
 
-    # ── Step 3: section 按空行切段落 ─────────────────────────
+        flush_text()
+        return [section for section in sections if section.blocks]
 
-    def _split_by_paragraphs(self, text: str) -> list[str]:
-        return [p for p in re.split(r"\n\s*\n", text) if p.strip()]
+    def _split_section(self, section: _Section) -> list[str]:
+        heading = "\n".join(section.heading_path)
+        if not section.blocks:
+            return []
 
-    # ── Step 5: 超限单元降级 ──────────────────────────────────
+        # Keep room for the heading context in every chunk. chunk_size is a
+        # maximum for an oversized semantic unit, not a target to fill.
+        heading_cost = len(heading) + 2 if heading else 0
+        body_capacity = self.chunk_size - heading_cost
+        if body_capacity <= 0:
+            body_capacity = self.chunk_size
+            heading = ""
 
-    def _degrade_code(self, code: str, meta: dict | None) -> list[dict]:
-        """代码块降级：按空行或行组切，每块不超过 chunk_size。"""
-        groups = re.split(r"\n\s*\n", code)
-        result: list[dict] = []
-        buf = ""
-        for g in groups:
-            candidate = buf + "\n\n" + g if buf else g
-            if len(candidate) <= self.chunk_size:
-                buf = candidate
-            else:
-                if buf.strip():
-                    result.append({"text": buf, "type": "code", "meta": meta})
-                buf = g
-        if buf.strip():
-            result.append({"text": buf, "type": "code", "meta": meta})
-        # 如果单个 group 仍然超限，按行组切
-        final: list[dict] = []
-        for u in result:
-            if len(u["text"]) <= self.chunk_size:
-                final.append(u)
-            else:
-                final.extend(self._degrade_code_by_lines(u["text"], u["meta"]))
-        return final
+        rendered: list[str] = []
+        for block in section.blocks:
+            pieces = self._split_block(block, body_capacity)
+            rendered.extend(self._render_block(pieces, heading, body_capacity, block.kind))
+        return rendered
 
-    def _degrade_code_by_lines(self, code: str, meta: dict | None) -> list[dict]:
-        """行组切分：每 N 行一组，不超过 chunk_size。"""
-        lines = code.split("\n")
-        result: list[dict] = []
-        buf = ""
+    def _render_block(
+        self,
+        pieces: list[str],
+        heading: str,
+        capacity: int,
+        kind: Literal["prose", "list", "code"],
+    ) -> list[str]:
+        """Render one semantic block without combining it with its neighbors."""
+        rendered: list[str] = []
+        use_overlap = self.chunk_overlap > 0 and kind == "prose" and len(pieces) > 1
+        for index, piece in enumerate(pieces):
+            body = piece
+            if use_overlap and index:
+                tail = pieces[index - 1][-self.chunk_overlap :]
+                room = capacity - len(body) - 2
+                if room > 0:
+                    body = f"{tail[-room:]}\n\n{body}"
+            rendered.append(f"{heading}\n\n{body}" if heading else body)
+        return rendered
+
+    def _split_block(self, block: _Block, capacity: int) -> list[str]:
+        if len(block.text) <= capacity:
+            return [block.text]
+        if block.kind == "code":
+            return self._pack_code_lines(block.text.splitlines(), capacity)
+        if block.kind == "list":
+            return self._split_list(block.text, capacity)
+        return self._split_prose(block.text, capacity)
+
+    def _pack_code_lines(self, lines: list[str], capacity: int) -> list[str]:
+        """Pack code lines while retaining indentation and line structure."""
+        packed: list[str] = []
+        current = ""
         for line in lines:
-            candidate = buf + "\n" + line if buf else line
-            if len(candidate) <= self.chunk_size:
-                buf = candidate
+            parts = self._hard_split(line, capacity) if len(line) > capacity else [line]
+            for part in parts:
+                candidate = f"{current}\n{part}" if current else part
+                if current and len(candidate) > capacity:
+                    packed.append(current)
+                    current = part
+                else:
+                    current = candidate
+        if current:
+            packed.append(current)
+        return packed
+
+    def _split_list(self, text: str, capacity: int) -> list[str]:
+        """Keep list items together, falling back to sentences/chars per item."""
+        items: list[str] = []
+        current: list[str] = []
+        for line in text.splitlines():
+            if self._list_item_re.match(line) and current:
+                items.append("\n".join(current).strip())
+                current = []
+            current.append(line)
+        if current:
+            items.append("\n".join(current).strip())
+
+        pieces: list[str] = []
+        for item in items:
+            if len(item) <= capacity:
+                pieces.append(item)
             else:
-                if buf.strip():
-                    result.append({"text": buf, "type": "code", "meta": meta})
-                buf = line
-        if buf.strip():
-            result.append({"text": buf, "type": "code", "meta": meta})
-        return result
+                pieces.extend(self._split_prose(item, capacity))
+        return pieces
 
-    def _degrade_paragraph(self, text: str) -> list[dict]:
-        """段落回退到句子切分。"""
-        # 中英文句尾切分，保留分隔符
-        sentences = re.split(r"(?<=[。！？.!?\n])\s*", text)
-        result: list[dict] = []
-        for s in sentences:
-            if s.strip():
-                result.append({"text": s, "type": "prose", "meta": None})
-        return result
-
-    # ── Step 4 + 6: 贪心装箱 + 单元级 overlap ────────────────
-
-    def _greedy_pack(self, units: list[dict]) -> list[str]:
-        """贪心装箱：单元永不跨箱。"""
-        if not units:
-            return []
-
-        chunks: list[str] = []
-        current_parts: list[str] = []
-        current_len = 0
-
-        for u in units:
-            u_len = len(u["text"])
-            if current_len + u_len <= self.chunk_size:
-                current_parts.append(u["text"])
-                current_len += u_len
+    def _split_prose(self, text: str, capacity: int) -> list[str]:
+        sentences = [part.strip() for part in self._sentence_re.split(text) if part.strip()]
+        pieces: list[str] = []
+        for sentence in sentences or [text]:
+            if len(sentence) <= capacity:
+                pieces.append(sentence)
             else:
-                # 当前箱满了，保存
-                if current_parts:
-                    chunks.append("\n\n".join(current_parts))
-                current_parts = [u["text"]]
-                current_len = u_len
+                pieces.extend(self._hard_split(sentence, capacity))
+        return pieces
 
-        if current_parts:
-            chunks.append("\n\n".join(current_parts))
-
-        return chunks
-
-    def _apply_overlap(self, chunks: list[str]) -> list[str]:
-        """单元级 overlap：新块（从第二个开始）开头附加前块的最后一个单元。"""
-        if self.chunk_overlap <= 0 or len(chunks) <= 1:
-            return chunks
-
-        overlapped: list[str] = [chunks[0]]
-        for i in range(1, len(chunks)):
-            prev_parts = chunks[i - 1].split("\n\n")
-            # 取前块最后一个单元（按当前 chunk_overlap 截断）
-            tail = prev_parts[-1]
-            if len(tail) > self.chunk_overlap:
-                tail = tail[:self.chunk_overlap]
-            # 如果前缀已在新块中出现则跳过
-            new_chunk = chunks[i]
-            if not new_chunk.startswith(tail):
-                new_chunk = tail + "\n\n" + new_chunk
-            overlapped.append(new_chunk)
-        return overlapped
-
-    # ── Step 7: 短尾块并入前块 ────────────────────────────────
-
-    def _merge_short_tail(self, chunks: list[str]) -> list[str]:
-        """短尾块（< min_chunk_size）并入前块，不丢弃。"""
-        if not chunks:
-            return []
-
-        merged: list[str] = [chunks[0]]
-        for c in chunks[1:]:
-            if len(c.strip()) < self.min_chunk_size:
-                # 并入前块
-                merged[-1] = merged[-1] + "\n\n" + c
-            else:
-                merged.append(c)
-
-        # 处理第一个块本身就是短块的情况：如果整体都很短就保留（不丢弃）
-        return merged
+    @staticmethod
+    def _hard_split(text: str, capacity: int) -> list[str]:
+        if capacity <= 0:
+            raise ValueError("切片容量必须大于 0")
+        return [text[start : start + capacity] for start in range(0, len(text), capacity)]
 
 
 def split_text(
@@ -272,7 +289,7 @@ def split_text(
     strategy: Literal["recursive", "sentence"] = "recursive",
     min_chunk_size: int = 64,
 ) -> list[Chunk]:
-    """便捷函数：直接传入文本 + 文档名返回 Chunk 列表。"""
+    """Convenience wrapper for Markdown-aware semantic splitting."""
     return TextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
@@ -281,9 +298,36 @@ def split_text(
     ).split(text, doc_name=doc_name)
 
 
+def split_pdf_file(path: str | Path, **kwargs) -> list[Chunk]:
+    """Split PDF pages independently and retain the source page in metadata."""
+    path = Path(path)
+    options = dict(kwargs)
+    doc_name = options.pop("doc_name", path.name)
+    result: list[Chunk] = []
+    for page_number, page_text in load_pdf_pages(path):
+        page_chunks = split_text(page_text, doc_name=doc_name, **options)
+        for chunk in page_chunks:
+            result.append(
+                Chunk(
+                    text=chunk.text,
+                    chunk_id=f"{doc_name}-{len(result)}",
+                    doc_name=doc_name,
+                    metadata={**(chunk.metadata or {}), "page": page_number},
+                )
+            )
+    return result
+
+
+def split_document(path: str | Path, **kwargs) -> list[Chunk]:
+    """Load and split a document, using page-aware rules for PDF files."""
+    path = Path(path)
+    options = dict(kwargs)
+    doc_name = options.pop("doc_name", path.name)
+    if path.suffix.lower() == ".pdf":
+        return split_pdf_file(path, doc_name=doc_name, **options)
+    return split_text(load(path), doc_name=doc_name, **options)
+
+
 def split_file(path: str | Path, **kwargs) -> list[Chunk]:
-    """从文件路径自动读取并切片（内部调用 loaders.load）。"""
-    from pathlib import Path
-    text = load(Path(path))
-    doc_name = Path(path).name
-    return split_text(text, doc_name=doc_name, **kwargs)
+    """Backward-compatible alias for document-aware splitting."""
+    return split_document(path, **kwargs)
