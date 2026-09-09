@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import os
 import re
 from pathlib import Path
 
@@ -26,6 +28,48 @@ def load_pdf_pages(path: Path | str) -> list[tuple[int, str]]:
             if blocks:
                 pages.append((page_number, "\n\n".join(blocks)))
     return pages
+
+
+def describe_images(page, page_number: int, min_width: int = 40, min_height: int = 40) -> str:
+    """用视觉 LLM 给页面图片生成简短描述，拼入本页切片使内容可检索。"""
+    from src.llm.client import get_llm
+
+    llm = get_llm()
+    if not llm.enabled:
+        return ""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for xref in page.get_images(full=True):
+        try:
+            pix = pymupdf.Pixmap(page.parent, xref[0])
+        except Exception:
+            continue
+        if pix.width < min_width or pix.height < min_height:
+            continue  # 图标/装饰小图
+        if pix.n - pix.alpha > 3:
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        b64 = base64.b64encode(pix.tobytes("png")).decode()
+        try:
+            response = llm._get_client().chat.completions.create(
+                model=os.getenv("VISION_MODEL") or llm.model,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "用不超过50字描述这张图的内容与作用。"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ],
+                }],
+                max_tokens=100,
+            )
+            caption = (response.choices[0].message.content or "").strip()
+            if caption and caption not in seen:
+                seen.add(caption)
+                parts.append(caption)
+        except Exception:
+            continue  # 单图失败不影响该页其余内容
+    if not parts:
+        return ""
+    return f"第{page_number}页（图片）：" + "；".join(parts)
 
 
 def load_pdf(path: Path | str) -> str:

@@ -44,6 +44,7 @@ def ensure_database() -> None:
 
     with connection() as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         conn.execute(
             f"""
             CREATE TABLE IF NOT EXISTS documents (
@@ -73,6 +74,10 @@ def ensure_database() -> None:
             CREATE INDEX IF NOT EXISTS chunks_embedding_idx
                 ON chunks USING hnsw (embedding vector_cosine_ops);
             CREATE INDEX IF NOT EXISTS chunks_document_idx ON chunks(document_id);
+            CREATE INDEX IF NOT EXISTS chunks_metadata_idx
+                ON chunks USING gin (metadata jsonb_path_ops);
+            CREATE INDEX IF NOT EXISTS chunks_text_trgm_idx
+                ON chunks USING gin (text gin_trgm_ops);
             CREATE TABLE IF NOT EXISTS conversation_messages (
                 id UUID PRIMARY KEY,
                 conversation_id TEXT NOT NULL,
@@ -83,6 +88,13 @@ def ensure_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS conversation_messages_idx
                 ON conversation_messages(conversation_id, created_at);
+            CREATE TABLE IF NOT EXISTS doc_index (
+                doc_id TEXT PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+                doc_name TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                embedding vector({_VECTOR_DIM}) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             """
         )
         vector_type = conn.execute(
@@ -160,8 +172,9 @@ def replace_chunks(
     if metadata is not None and len(texts) != len(metadata):
         raise ValueError("texts and metadata length mismatch")
     metadata = metadata or [{} for _ in texts]
-    rows = [
-        (
+    values = []
+    for index, (text, embedding, item_metadata) in enumerate(zip(texts, embeddings, metadata)):
+        values.extend([
             str(uuid.uuid4()),
             doc_id,
             doc_name,
@@ -169,18 +182,18 @@ def replace_chunks(
             text,
             vector_literal(embedding),
             json.dumps(item_metadata),
-        )
-        for index, (text, embedding, item_metadata) in enumerate(zip(texts, embeddings, metadata))
-    ]
+        ])
+    rows = "(" + "),(".join([", ".join(["%s, %s, %s, %s, %s, %s::vector, %s"]) for _ in texts]) + ")"
     with connection() as conn:
         # Transactional replacement: encoding happens before this function.
         conn.execute("DELETE FROM chunks WHERE document_id = %s", (doc_id,))
-        conn.executemany(
-            """
+        # ponytail: 单条多行 INSERT，参数数 = 7*chunks，超过 PG 65535 参数上限（约 9000 chunk/文档）时改用 COPY
+        conn.execute(
+            f"""
             INSERT INTO chunks (id, document_id, doc_name, chunk_index, text, embedding, metadata)
-            VALUES (%s, %s, %s, %s, %s, %s::vector, %s)
+            VALUES {rows}
             """,
-            rows,
+            values,
         )
 
 
@@ -192,24 +205,86 @@ def get_chunks(doc_id: str) -> list[dict]:
         ))
 
 
-def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | None = None) -> list[dict]:
+def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | None = None, filters: dict | None = None) -> list[dict]:
+    """向量通道；filters 为 metadata JSONB 包含条件，如 {"page": 5}、{"figure": True}。"""
     query_vector = vector_literal(query_embedding)
-    where = ""
-    filters: list[object] = []
+    where: list[str] = []
+    params: list[object] = []
     if doc_id:
-        where = "WHERE document_id = %s"
-        filters.append(doc_id)
+        where.append("document_id = %s")
+        params.append(doc_id)
+    if filters:
+        where.append("metadata @> %s::jsonb")
+        params.append(json.dumps(filters, ensure_ascii=False))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     with connection() as conn:
         return list(conn.execute(
             f"""
             SELECT id::text AS chunk_id, document_id, doc_name, chunk_index, text, metadata,
                    1 - (embedding <=> %s::vector) AS score
             FROM chunks
-            {where}
+            {where_sql}
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,
-            [query_vector, *filters, query_vector, top_k],
+            [query_vector, *params, query_vector, top_k],
+        ))
+
+
+def keyword_chunks(terms: list[str], limit: int = 50, filters: dict | None = None) -> list[dict]:
+    """词汇通道：大小写不敏感子串匹配，由 trigram GIN 索引服务；filters 同 search_chunks。"""
+    if not terms:
+        return []
+    def _escape(term: str) -> str:
+        return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    patterns = [f"%{_escape(t)}%" for t in terms]
+    # ponytail: GIN trigram 只支持单模式/AND，多词 OR 退回 Seq Scan；数据量大时换 tsvector+zhparser 分词列
+    where = ["(" + " OR ".join(["text ILIKE %s"] * len(patterns)) + ")"]
+    params: list[object] = list(patterns)
+    if filters:
+        where.append("metadata @> %s::jsonb")
+        params.append(json.dumps(filters, ensure_ascii=False))
+    sql = f"""
+        SELECT id::text AS chunk_id, document_id, doc_name, chunk_index, text, metadata,
+               0::double precision AS score
+        FROM chunks
+        WHERE {' AND '.join(where)}
+        LIMIT %s
+    """
+    with connection() as conn:
+        return list(conn.execute(sql, [*params, limit]))
+
+
+def upsert_doc_index(doc_id: str, doc_name: str, summary: str, embedding: list[float]) -> None:
+    """路由层：每个文档一行极短摘要 + 向量，用于检索前定位目标文档。"""
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO doc_index (doc_id, doc_name, summary, embedding, updated_at)
+            VALUES (%s, %s, %s, %s::vector, now())
+            ON CONFLICT (doc_id) DO UPDATE
+                SET doc_name = EXCLUDED.doc_name,
+                    summary = EXCLUDED.summary,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = now()
+            """,
+            (doc_id, doc_name, summary, vector_literal(embedding)),
+        )
+
+
+def search_doc_index(query_embedding: list[float], top_k: int = 3) -> list[dict]:
+    """第一步路由：向量命中最相关的文档。"""
+    query_vector = vector_literal(query_embedding)
+    with connection() as conn:
+        return list(conn.execute(
+            """
+            SELECT doc_id, doc_name, summary, 1 - (embedding <=> %s::vector) AS score
+            FROM doc_index
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (query_vector, query_vector, top_k),
         ))
 
 

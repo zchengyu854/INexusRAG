@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from src.ingestion.loaders import load, load_pdf_pages
+from src.ingestion.loaders import describe_images, load, load_pdf_pages
 
 
 @dataclass
@@ -286,23 +286,39 @@ def split_text(
     ).split(text, doc_name=doc_name)
 
 
-def split_pdf_file(path: str | Path, **kwargs) -> list[Chunk]:
+def split_pdf_file(path: str | Path, doc_name: str | None = None, include_images: bool = True, **kwargs) -> list[Chunk]:
     """Split PDF pages independently and retain the source page in metadata."""
+    import pymupdf as _pymupdf
+
     path = Path(path)
     options = dict(kwargs)
-    doc_name = options.pop("doc_name", path.name)
+    if doc_name is None:
+        doc_name = path.name
     result: list[Chunk] = []
-    for page_number, page_text in load_pdf_pages(path):
-        page_chunks = split_text(page_text, doc_name=doc_name, **options)
-        for chunk in page_chunks:
-            result.append(
-                Chunk(
-                    text=chunk.text,
-                    chunk_id=f"{doc_name}-{len(result)}",
-                    doc_name=doc_name,
-                    metadata={**(chunk.metadata or {}), "page": page_number},
+    doc = _pymupdf.open(path)
+    try:
+        for page_number, page_text in load_pdf_pages(path):
+            page_chunks = split_text(page_text, doc_name=doc_name, **options)
+            if include_images:
+                description = describe_images(doc[page_number - 1], page_number)
+                if description:
+                    page_chunks.append(Chunk(
+                        text=description,
+                        chunk_id="",
+                        doc_name=doc_name,
+                        metadata={"page": page_number, "figure": True},
+                    ))
+            for chunk in page_chunks:
+                result.append(
+                    Chunk(
+                        text=chunk.text,
+                        chunk_id=f"{doc_name}-{len(result)}",
+                        doc_name=doc_name,
+                        metadata={**(chunk.metadata or {}), "page": page_number},
+                    )
                 )
-            )
+    finally:
+        doc.close()
     return result
 
 

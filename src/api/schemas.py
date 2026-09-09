@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -7,6 +9,8 @@ class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     top_k: int = Field(5, ge=1, le=50)
     conversation_id: str | None = Field(None, min_length=1, max_length=100)
+    # 元数据过滤（JSONB 包含）：如 {"page": 5}、{"figure": true}；None 表示不过滤
+    filters: dict[str, Any] | None = Field(None, max_length=8)
 
 
 class Source(BaseModel):

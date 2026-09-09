@@ -24,6 +24,7 @@ from src.api.schemas import (
 from src.ingestion.embedder import get_embedder
 from src.ingestion.splitter import split_document
 from src.llm.client import get_llm
+from src.retrieval import extract_terms, index_document_route, two_stage_search
 from src.storage.database import (
     create_document,
     delete_document as delete_document_record,
@@ -32,7 +33,6 @@ from src.storage.database import (
     list_documents as list_database_documents,
     list_conversations,
     replace_chunks,
-    search_chunks,
     stats as database_stats,
     update_document,
     delete_messages,
@@ -121,6 +121,7 @@ def _ingest_document(doc_id: str) -> None:
         texts = [chunk.text for chunk in chunks]
         embeddings = get_embedder().encode(texts)
         replace_chunks(doc_id, doc["filename"], texts, embeddings, [chunk.metadata or {} for chunk in chunks])
+        index_document_route(doc_id, doc["filename"], chunks, get_embedder().encode)
         update_document(
             doc_id,
             status="ready",
@@ -233,6 +234,7 @@ def rechunk_document(doc_id: str, request: RechunkRequest):
         # Prepare embeddings before replacing anything in PostgreSQL.
         embeddings = get_embedder().encode(texts)
         replace_chunks(doc_id, doc["filename"], texts, embeddings, [chunk.metadata or {} for chunk in chunks])
+        index_document_route(doc_id, doc["filename"], chunks, get_embedder().encode)
         latency_ms = (time.perf_counter() - t0) * 1000
         update_document(
             doc_id,
@@ -320,7 +322,7 @@ def query(request: QueryRequest):
         )
 
     query_embedding = get_embedder().encode([request.question])[0]
-    results = search_chunks(query_embedding, top_k=request.top_k)
+    results = two_stage_search(query_embedding, top_k=request.top_k, terms=extract_terms(request.question), filters=request.filters)
     if not results:
         answer = "未检索到相关内容，请先上传并入库文档。"
         save_message(conversation_id, "assistant", answer)

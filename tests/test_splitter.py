@@ -5,7 +5,7 @@ from pathlib import Path
 import pymupdf
 
 from src.ingestion.loaders import load_md
-from src.ingestion.splitter import split_document, split_text
+from src.ingestion.splitter import split_document, split_pdf_file, split_text
 
 
 class SplitterTests(unittest.TestCase):
@@ -90,6 +90,28 @@ if True:
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk.text) <= 32 for chunk in chunks))
         self.assertEqual("".join(chunk.text for chunk in chunks), text)
+
+    def test_figure_description_is_stored_as_chunk_with_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fig.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_text((72, 72), "Body text.")
+            page.insert_image(pymupdf.Rect(72, 100, 300, 260),
+                              pixmap=pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 200, 150)))
+            document.save(path)
+            document.close()
+
+            from unittest.mock import patch
+            with patch("src.ingestion.splitter.describe_images",
+                       return_value="第1页（图片）：检索流程示意图") as mock_desc:
+                chunks = split_pdf_file(path, doc_name="fig.pdf", include_images=True)
+            mock_desc.assert_called_once()
+
+        figures = [c for c in chunks if c.metadata.get("figure")]
+        self.assertEqual(len(figures), 1)
+        self.assertEqual(figures[0].metadata["page"], 1)
+        self.assertIn("第1页（图片）", figures[0].text)
 
     def test_overlap_and_short_tail_never_exceed_limit(self):
         text = "# Notes\n\n" + "Sentence one. Sentence two. Sentence three. " * 8

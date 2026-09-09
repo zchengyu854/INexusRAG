@@ -136,11 +136,16 @@ export async function getConversations(): Promise<ConversationSummary[]> {
   return res.json()
 }
 
-export async function queryDoc(question: string, conversationId: string, topK = 5): Promise<{ answer: string; sources: Source[]; conversation_id: string }> {
+export async function queryDoc(
+  question: string,
+  conversationId: string,
+  topK = 5,
+  filters?: Record<string, string | number | boolean>
+): Promise<{ answer: string; sources: Source[]; conversation_id: string }> {
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, conversation_id: conversationId, top_k: topK }),
+    body: JSON.stringify({ question, conversation_id: conversationId, top_k: topK, ...(filters ? { filters } : {}) }),
   })
   if (!res.ok) throw new Error("Query failed")
   return res.json()

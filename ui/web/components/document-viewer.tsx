@@ -142,7 +142,7 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
       <Card>
         <CardHeader>
           <CardTitle>Indexed chunks ({totalChunks})</CardTitle>
-          <p className="text-sm text-muted-foreground">Historical result currently stored in PostgreSQL</p>
+          <p className="text-sm text-muted-foreground">{Math.min(chunks.length, totalChunks)} of {totalChunks} chunks shown, stored in PostgreSQL</p>
         </CardHeader>
         <CardContent>
           {loading ? (
