@@ -19,7 +19,7 @@ interface DocumentViewerProps {
 export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentViewerProps) {
   const [chunks, setChunks] = useState<Chunk[]>([])
   const [totalChunks, setTotalChunks] = useState(0)
-  const [config, setConfig] = useState({ chunk_size: 512, chunk_overlap: 64, strategy: "recursive" })
+  const [config, setConfig] = useState({ chunk_size: 512, chunk_overlap: 64 })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [showRechunk, setShowRechunk] = useState(false)
@@ -37,7 +37,6 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
       setConfig({
         chunk_size: data.config.chunk_size,
         chunk_overlap: data.config.chunk_overlap,
-        strategy: data.config.strategy,
       })
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load chunks")
@@ -48,31 +47,19 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
 
   useEffect(() => {
     let cancelled = false
-    const startLoad = () => {
-      getChunks(doc.id).then((data) => {
-        if (cancelled) return
-        setChunks(data.chunks)
-        setTotalChunks(data.total)
-        const nextConfig = {
-          chunk_size: data.config.chunk_size,
-          chunk_overlap: data.config.chunk_overlap,
-          strategy: data.config.strategy,
-        }
-        setConfig(nextConfig)
-        setPreviewLoading(true)
-        return previewRechunk(doc.id, nextConfig)
-      }).then((nextPreview) => {
-        if (!cancelled && nextPreview) setPreview(nextPreview)
-      }).catch((error) => {
-        if (!cancelled) setError(error instanceof Error ? error.message : "Failed to load chunks")
-      }).finally(() => {
-        if (!cancelled) {
-          setLoading(false)
-          setPreviewLoading(false)
-        }
+    getChunks(doc.id).then((data) => {
+      if (cancelled) return
+      setChunks(data.chunks)
+      setTotalChunks(data.total)
+      setConfig({
+        chunk_size: data.config.chunk_size,
+        chunk_overlap: data.config.chunk_overlap,
       })
-    }
-    startLoad()
+    }).catch((error) => {
+      if (!cancelled) setError(error instanceof Error ? error.message : "Failed to load chunks")
+    }).finally(() => {
+      if (!cancelled) setLoading(false)
+    })
     return () => { cancelled = true }
   }, [doc.id])
 

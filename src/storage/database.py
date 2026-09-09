@@ -11,6 +11,8 @@ import psycopg
 from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
+from src.config import embedding_dimension
+
 load_dotenv()
 
 _DB_NAME = os.getenv("POSTGRES_DB", "nexus_rag")
@@ -19,7 +21,7 @@ _DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
 _DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 _DB_USER = os.getenv("POSTGRES_USER", "postgres")
 _DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
-_VECTOR_DIM = int(os.getenv("EMBEDDING_DIMENSION", "1024"))
+_VECTOR_DIM = embedding_dimension()
 
 
 def _dsn(database: str = _DB_NAME) -> str:
@@ -83,6 +85,20 @@ def ensure_database() -> None:
                 ON conversation_messages(conversation_id, created_at);
             """
         )
+        vector_type = conn.execute(
+            """
+            SELECT format_type(a.atttypid, a.atttypmod) AS type
+            FROM pg_attribute AS a
+            JOIN pg_class AS c ON c.oid = a.attrelid
+            JOIN pg_namespace AS n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relname = 'chunks' AND a.attname = 'embedding'
+            """
+        ).fetchone()["type"]
+        expected_type = f"vector({_VECTOR_DIM})"
+        if vector_type != expected_type:
+            raise RuntimeError(
+                f"数据库向量维度为 {vector_type}，配置要求 {expected_type}；请迁移或重建 chunks 表"
+            )
 
 
 def vector_literal(values: list[float]) -> str:
@@ -177,12 +193,12 @@ def get_chunks(doc_id: str) -> list[dict]:
 
 
 def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | None = None) -> list[dict]:
+    query_vector = vector_literal(query_embedding)
     where = ""
-    params: list[object] = [vector_literal(query_embedding)]
+    filters: list[object] = []
     if doc_id:
         where = "WHERE document_id = %s"
-        params.append(doc_id)
-    params.append(top_k)
+        filters.append(doc_id)
     with connection() as conn:
         return list(conn.execute(
             f"""
@@ -190,10 +206,10 @@ def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | No
                    1 - (embedding <=> %s::vector) AS score
             FROM chunks
             {where}
-            ORDER BY score DESC
+            ORDER BY embedding <=> %s::vector
             LIMIT %s
             """,
-            params,
+            [query_vector, *filters, query_vector, top_k],
         ))
 
 

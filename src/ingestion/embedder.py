@@ -10,7 +10,7 @@ Embedding 封装模块
   EMBEDDING_API_KEY=your_key
   EMBEDDING_BASE_URL=https://api.openai.com/v1
   EMBEDDING_MODEL=text-embedding-3-small
-  EMBEDDING_DIMENSION=1536
+  EMBEDDING_DIMENSION=1536 (local BAAI/bge-m3 defaults to 1024)
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Iterable
 
 from dotenv import load_dotenv
+
+from src.config import embedding_dimension
 
 load_dotenv()
 
@@ -41,7 +43,7 @@ class Embedder:
         self.api_key = _get_env("EMBEDDING_API_KEY", "")
         self.base_url = _get_env("EMBEDDING_BASE_URL", "https://api.openai.com/v1")
         self.model = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
-        self.dimension = int(_get_env("EMBEDDING_DIMENSION", "1536"))
+        self.dimension = embedding_dimension()
 
         if self.provider == "openai":
             self._client = self._init_openai()
@@ -89,9 +91,14 @@ class Embedder:
             return []
 
         if self.provider == "openai":
-            return self._encode_openai(texts)
+            embeddings = self._encode_openai(texts)
         else:
-            return self._encode_local(texts)
+            embeddings = self._encode_local(texts)
+        if embeddings and len(embeddings[0]) != self.dimension:
+            raise ValueError(
+                f"embedding dimension mismatch: configured {self.dimension}, got {len(embeddings[0])}"
+            )
+        return embeddings
 
     def _encode_openai(self, texts: list[str]) -> list[list[float]]:
         """OpenAI API 批量编码。"""

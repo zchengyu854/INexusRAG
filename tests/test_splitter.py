@@ -23,7 +23,7 @@ Intro.
 
 It works.
 """
-        chunks = split_text(text, doc_name="guide.md", chunk_size=96, chunk_overlap=0, min_chunk_size=16)
+        chunks = split_text(text, doc_name="guide.md", chunk_size=96, chunk_overlap=0)
 
         self.assertTrue(chunks)
         self.assertTrue(all(len(chunk.text) <= 96 for chunk in chunks))
@@ -38,7 +38,7 @@ It works.
 
     def test_paragraphs_are_not_filled_to_chunk_size(self):
         text = "# Notes\n\nShort paragraph one.\n\nShort paragraph two."
-        chunks = split_text(text, chunk_size=512, chunk_overlap=64, min_chunk_size=8)
+        chunks = split_text(text, chunk_size=512, chunk_overlap=64)
 
         self.assertEqual(len(chunks), 2)
         self.assertIn("Short paragraph one.", chunks[0].text)
@@ -60,7 +60,7 @@ if True:
             loaded = load_md(path)
 
         self.assertIn("=====", loaded)
-        chunks = split_text(loaded, doc_name="guide.md", chunk_size=48, chunk_overlap=0, min_chunk_size=8)
+        chunks = split_text(loaded, doc_name="guide.md", chunk_size=48, chunk_overlap=0)
         combined = "\n".join(chunk.text for chunk in chunks)
         self.assertIn("```python", combined)
         self.assertIn('    print("ok")', combined)
@@ -76,7 +76,7 @@ if True:
             document.save(path)
             document.close()
 
-            chunks = split_document(path, chunk_size=96, chunk_overlap=0, min_chunk_size=8)
+            chunks = split_document(path, chunk_size=96, chunk_overlap=0)
 
         self.assertEqual([chunk.metadata["page"] for chunk in chunks], [1, 2])
         self.assertIn("Page one", chunks[0].text)
@@ -85,7 +85,7 @@ if True:
 
 
         text = "没有句号的超长内容" * 30
-        chunks = split_text(text, chunk_size=32, chunk_overlap=0, min_chunk_size=8)
+        chunks = split_text(text, chunk_size=32, chunk_overlap=0)
 
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk.text) <= 32 for chunk in chunks))
@@ -93,7 +93,7 @@ if True:
 
     def test_overlap_and_short_tail_never_exceed_limit(self):
         text = "# Notes\n\n" + "Sentence one. Sentence two. Sentence three. " * 8
-        chunks = split_text(text, chunk_size=80, chunk_overlap=12, min_chunk_size=20)
+        chunks = split_text(text, chunk_size=80, chunk_overlap=12)
 
         self.assertTrue(all(len(chunk.text) <= 80 for chunk in chunks))
         if len(chunks) > 1:

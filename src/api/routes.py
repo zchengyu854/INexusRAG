@@ -80,7 +80,6 @@ def _read_and_split(doc: dict, config: DocConfig):
         doc_name=doc["filename"],
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
-        strategy=config.strategy,
     )
     if not chunks:
         raise ValueError("切片后无有效内容")
@@ -102,7 +101,7 @@ def _chunk_previews(doc: dict, chunks: list[dict], config: DocConfig) -> list[Do
 
 
 @router.get("/stats", response_model=SystemStats)
-async def get_stats():
+def get_stats():
     current = database_stats()
     return SystemStats(
         total_documents=current["total_documents"],
@@ -181,7 +180,7 @@ async def get_chunks_preview(doc_id: str):
         doc_id=doc_id,
         filename=doc["filename"],
         total_chunks=len(chunks),
-        strategy=config.strategy,
+        strategy="recursive",
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         chunks=_chunk_previews(doc, chunks, config),
@@ -189,7 +188,7 @@ async def get_chunks_preview(doc_id: str):
 
 
 @router.post("/documents/{doc_id}/preview", response_model=ChunksPreviewResponse)
-async def preview_rechunk(doc_id: str, request: RechunkRequest):
+def preview_rechunk(doc_id: str, request: RechunkRequest):
     doc = get_document(doc_id)
     if not doc:
         raise HTTPException(404, "文档不存在")
@@ -213,7 +212,7 @@ async def preview_rechunk(doc_id: str, request: RechunkRequest):
         doc_id=doc_id,
         filename=doc["filename"],
         total_chunks=len(previews),
-        strategy=config.strategy,
+        strategy="recursive",
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
         chunks=previews,
@@ -221,7 +220,7 @@ async def preview_rechunk(doc_id: str, request: RechunkRequest):
 
 
 @router.post("/documents/{doc_id}/rechunk", response_model=RechunkResult)
-async def rechunk_document(doc_id: str, request: RechunkRequest):
+def rechunk_document(doc_id: str, request: RechunkRequest):
     doc = get_document(doc_id)
     if not doc:
         raise HTTPException(404, "文档不存在")
@@ -304,7 +303,7 @@ async def clear_conversation(conversation_id: str):
 
 
 @router.post("/query", response_model=QueryResponse)
-async def query(request: QueryRequest):
+def query(request: QueryRequest):
     t0 = time.perf_counter()
     conversation_id = request.conversation_id or str(uuid.uuid4())
     history = get_messages(conversation_id, limit=10)

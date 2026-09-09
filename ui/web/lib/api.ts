@@ -34,7 +34,6 @@ export interface Chunk {
 }
 
 export interface DocConfig {
-  strategy: string
   chunk_size: number
   chunk_overlap: number
 }
@@ -53,9 +52,13 @@ export interface PreviewResult {
 }
 
 export interface RechunkResult {
+  doc_id: string
+  filename: string
   success: boolean
   old_chunks: number
   new_chunks: number
+  old_config: DocConfig
+  new_config: DocConfig
   latency_ms: number
   error?: string
 }
@@ -95,14 +98,13 @@ export async function getChunks(docId: string, pageSize = 20): Promise<{ chunks:
     chunks: data.chunks.slice(0, pageSize),
     total: data.total_chunks,
     config: {
-      strategy: data.strategy,
       chunk_size: data.chunk_size,
       chunk_overlap: data.chunk_overlap,
     },
   }
 }
 
-export async function previewRechunk(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<PreviewResult> {
+export async function previewRechunk(docId: string, params: { chunk_size: number; chunk_overlap: number }): Promise<PreviewResult> {
   const res = await fetch(`${API_BASE}/documents/${docId}/preview`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -113,13 +115,7 @@ export async function previewRechunk(docId: string, params: { chunk_size: number
   return { total_chunks: data.total_chunks, chunks: data.chunks }
 }
 
-export async function rechunkDocument(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<{
-  success: boolean
-  old_chunks: number
-  new_chunks: number
-  latency_ms: number
-  error?: string
-}> {
+export async function rechunkDocument(docId: string, params: { chunk_size: number; chunk_overlap: number }): Promise<RechunkResult> {
   const res = await fetch(`${API_BASE}/documents/${docId}/rechunk`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -162,7 +158,7 @@ export async function clearConversation(conversationId: string): Promise<void> {
 }
 
 export async function getStats(): Promise<Stats> {
-  const res = await fetch(`${API_BASE}/stats`)
+  const res = await fetch(`${API_BASE}/stats`, { cache: "no-store" })
   if (!res.ok) throw new Error("Failed to fetch stats")
   return res.json()
 }

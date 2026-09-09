@@ -53,21 +53,13 @@ class TextSplitter:
         self,
         chunk_size: int = 512,
         chunk_overlap: int = 64,
-        strategy: Literal["recursive", "sentence"] = "recursive",
-        min_chunk_size: int = 64,
     ):
         if chunk_size < 1:
             raise ValueError("chunk_size 必须大于 0")
         if chunk_overlap < 0 or chunk_overlap >= chunk_size:
             raise ValueError("chunk_overlap 必须小于 chunk_size")
-        if min_chunk_size < 1:
-            raise ValueError("min_chunk_size 必须大于 0")
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        # Kept for API compatibility. Both historical strategies now use the
-        # same Markdown-aware semantic rules.
-        self.strategy = strategy
-        self.min_chunk_size = min_chunk_size
 
     def split(self, text: str, doc_name: str = "unknown") -> list[Chunk]:
         if not text.strip():
@@ -286,15 +278,11 @@ def split_text(
     doc_name: str = "unknown",
     chunk_size: int = 512,
     chunk_overlap: int = 64,
-    strategy: Literal["recursive", "sentence"] = "recursive",
-    min_chunk_size: int = 64,
 ) -> list[Chunk]:
     """Convenience wrapper for Markdown-aware semantic splitting."""
     return TextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        strategy=strategy,
-        min_chunk_size=min_chunk_size,
     ).split(text, doc_name=doc_name)
 
 

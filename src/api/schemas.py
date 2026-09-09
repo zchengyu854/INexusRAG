@@ -47,7 +47,7 @@ class DocInfo(BaseModel):
 
 
 class DocConfig(BaseModel):
-    strategy: str = "recursive"
+    strategy: str = "recursive"  # Deprecated; the Markdown splitter has one strategy.
     chunk_size: int = 512
     chunk_overlap: int = 64
 
@@ -55,7 +55,7 @@ class DocConfig(BaseModel):
 class RechunkRequest(BaseModel):
     chunk_size: int = Field(512, ge=64, le=4096)
     chunk_overlap: int = Field(64, ge=0, lt=4096)
-    strategy: str = "recursive"
+    strategy: str = "recursive"  # Deprecated; accepted for client compatibility.
 
     @model_validator(mode="after")
     def validate_overlap(self):
@@ -89,7 +89,7 @@ class ChunksPreviewResponse(BaseModel):
     doc_id: str
     filename: str
     total_chunks: int
-    strategy: str
+    strategy: str = "recursive"  # Deprecated; retained for API compatibility.
     chunk_size: int
     chunk_overlap: int
     chunks: list[DocChunkPreview]
