@@ -74,13 +74,12 @@ class Embedder:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         return SentenceTransformer(model_name, local_files_only=True)
 
-    def encode(self, texts: Iterable[str], batch_size: int = 32) -> list[list[float]]:
+    def encode(self, texts: Iterable[str]) -> list[list[float]]:
         """
-        将文本列表编码为向量。
+        将文本列表编码为向量（每批 32 条）。
 
         Args:
             texts: 文本列表
-            batch_size: 批处理大小
 
         Returns:
             向量列表，每个向量是 float 列表
@@ -104,8 +103,8 @@ class Embedder:
                 input=batch,
                 encoding_format="float",
             )
-            # 按原始顺序收集（API 可能重排）
-            for item in response.data:
+            # API 可能重排，按 index 固定回原始顺序
+            for item in sorted(response.data, key=lambda item: item.index):
                 all_embeddings.append(item.embedding)
         return all_embeddings
 

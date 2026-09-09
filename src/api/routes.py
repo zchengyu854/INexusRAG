@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
 
 from src.api.schemas import (
     ChunksPreviewResponse,
@@ -16,7 +13,6 @@ from src.api.schemas import (
     ConversationSummary,
     DocChunkPreview,
     DocConfig,
-    DocDetail,
     DocInfo,
     QueryRequest,
     QueryResponse,
@@ -75,11 +71,6 @@ def _source_path(doc: dict) -> Path:
     stored = Path(doc.get("source_path", ""))
     if stored.exists():
         return stored
-    # Compatibility for documents created before PostgreSQL migration.
-    for directory in (Path("data/test_docs"), Path("data")):
-        candidate = directory / doc["filename"]
-        if candidate.exists():
-            return candidate
     raise HTTPException(404, f"未找到源文件: {doc['filename']}")
 
 
@@ -177,24 +168,6 @@ async def trigger_ingest(doc_id: str, background_tasks: BackgroundTasks):
 @router.get("/documents", response_model=list[DocInfo])
 async def list_documents():
     return [_doc_info(doc) for doc in list_database_documents()]
-
-
-@router.get("/documents/{doc_id}/detail", response_model=DocDetail)
-async def get_doc_detail(doc_id: str):
-    doc = get_document(doc_id)
-    if not doc:
-        raise HTTPException(404, "文档不存在")
-    config = _doc_config(doc)
-    return DocDetail(
-        id=doc["id"],
-        filename=doc["filename"],
-        status=doc["status"],
-        chunks=doc["chunks"],
-        latency_ms=doc["latency_ms"],
-        config=config,
-        error=doc["error"],
-        embeddings=[],
-    )
 
 
 @router.get("/documents/{doc_id}/chunks", response_model=ChunksPreviewResponse)
@@ -374,25 +347,12 @@ async def query(request: QueryRequest):
     save_message(conversation_id, "assistant", answer, source_data)
     latency_ms = round((time.perf_counter() - t0) * 1000, 1)
 
-    if request.stream:
-        return StreamingResponse(
-            _sse_events(answer, sources),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache"},
-        )
     return QueryResponse(
         answer=answer,
         sources=sources,
         latency_ms=latency_ms,
         conversation_id=conversation_id,
     )
-
-
-async def _sse_events(answer: str, sources: list[Source]) -> AsyncGenerator[str, None]:
-    for source in sources:
-        yield f"data: {json.dumps({'type': 'source', 'data': source.model_dump()}, ensure_ascii=False)}\n\n"
-    yield f"data: {json.dumps({'type': 'token', 'data': answer}, ensure_ascii=False)}\n\n"
-    yield 'data: {"type":"done","data":null}\n\n'
 
 
 @router.delete("/documents/{doc_id}")

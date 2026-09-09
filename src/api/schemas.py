@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-from typing import Any
-
 from pydantic import BaseModel, Field, model_validator
 
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
-    stream: bool = True
     top_k: int = Field(5, ge=1, le=50)
     conversation_id: str | None = Field(None, min_length=1, max_length=100)
 
@@ -53,8 +50,6 @@ class DocConfig(BaseModel):
     strategy: str = "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
-    embedding_model: str = ""
-    embedding_dimension: int = 0
 
 
 class RechunkRequest(BaseModel):
@@ -79,17 +74,6 @@ class RechunkResult(BaseModel):
     latency_ms: float
     success: bool
     error: str | None = None
-
-
-class DocDetail(BaseModel):
-    id: str
-    filename: str
-    status: str
-    chunks: int
-    latency_ms: float
-    config: DocConfig
-    error: str | None = None
-    embeddings: list[list[float]] = []  # 每切片的前 8 维（向量预览）
 
 
 class DocChunkPreview(BaseModel):

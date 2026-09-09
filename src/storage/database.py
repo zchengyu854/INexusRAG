@@ -104,11 +104,6 @@ def get_document(doc_id: str) -> dict | None:
         return conn.execute("SELECT * FROM documents WHERE id = %s", (doc_id,)).fetchone()
 
 
-def get_document_by_source_path(source_path: str) -> dict | None:
-    with connection() as conn:
-        return conn.execute("SELECT * FROM documents WHERE source_path = %s", (source_path,)).fetchone()
-
-
 def list_documents() -> list[dict]:
     with connection() as conn:
         return list(conn.execute("SELECT * FROM documents ORDER BY created_at DESC"))
@@ -131,12 +126,6 @@ def update_document(doc_id: str, **fields: object) -> None:
         conn.execute(f"UPDATE documents SET {', '.join(assignments)} WHERE id = %s", values)
 
 
-def delete_document_by_filename(filename: str) -> int:
-    with connection() as conn:
-        result = conn.execute("DELETE FROM documents WHERE filename = %s", (filename,))
-        return result.rowcount
-
-
 def delete_document(doc_id: str) -> int:
     with connection() as conn:
         result = conn.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
@@ -155,25 +144,28 @@ def replace_chunks(
     if metadata is not None and len(texts) != len(metadata):
         raise ValueError("texts and metadata length mismatch")
     metadata = metadata or [{} for _ in texts]
+    rows = [
+        (
+            str(uuid.uuid4()),
+            doc_id,
+            doc_name,
+            index,
+            text,
+            vector_literal(embedding),
+            json.dumps(item_metadata),
+        )
+        for index, (text, embedding, item_metadata) in enumerate(zip(texts, embeddings, metadata))
+    ]
     with connection() as conn:
         # Transactional replacement: encoding happens before this function.
         conn.execute("DELETE FROM chunks WHERE document_id = %s", (doc_id,))
-        for index, (text, embedding, item_metadata) in enumerate(zip(texts, embeddings, metadata)):
-            conn.execute(
-                """
-                INSERT INTO chunks (id, document_id, doc_name, chunk_index, text, embedding, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s::vector, %s)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    doc_id,
-                    doc_name,
-                    index,
-                    text,
-                    vector_literal(embedding),
-                    json.dumps(item_metadata),
-                ),
-            )
+        conn.executemany(
+            """
+            INSERT INTO chunks (id, document_id, doc_name, chunk_index, text, embedding, metadata)
+            VALUES (%s, %s, %s, %s, %s, %s::vector, %s)
+            """,
+            rows,
+        )
 
 
 def get_chunks(doc_id: str) -> list[dict]:
@@ -198,10 +190,10 @@ def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | No
                    1 - (embedding <=> %s::vector) AS score
             FROM chunks
             {where}
-            ORDER BY embedding <=> %s::vector
+            ORDER BY score DESC
             LIMIT %s
             """,
-            [params[0], *(([params[1]] if doc_id else [])), params[0], params[-1]],
+            params,
         ))
 
 

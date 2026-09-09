@@ -37,8 +37,6 @@ export interface DocConfig {
   strategy: string
   chunk_size: number
   chunk_overlap: number
-  embedding_model: string
-  embedding_dimension: number
 }
 
 export interface Source {
@@ -67,17 +65,6 @@ export interface Stats {
   total_chunks: number
   embedding_dimension: number
   total_size_kb: number
-}
-
-interface ChunkDetail {
-  id: string
-  filename: string
-  status: string
-  chunks: number
-  latency_ms: number
-  config: DocConfig
-  error: string | null
-  embeddings: number[][]
 }
 
 export async function fetchDocs(): Promise<Doc[]> {
@@ -111,16 +98,8 @@ export async function getChunks(docId: string, pageSize = 20): Promise<{ chunks:
       strategy: data.strategy,
       chunk_size: data.chunk_size,
       chunk_overlap: data.chunk_overlap,
-      embedding_model: "",
-      embedding_dimension: 0,
     },
   }
-}
-
-export async function getDocDetail(docId: string): Promise<ChunkDetail> {
-  const res = await fetch(`${API_BASE}/documents/${docId}/detail`)
-  if (!res.ok) throw new Error("Failed to fetch detail")
-  return res.json()
 }
 
 export async function previewRechunk(docId: string, params: { chunk_size: number; chunk_overlap: number; strategy: string }): Promise<PreviewResult> {
@@ -165,7 +144,7 @@ export async function queryDoc(question: string, conversationId: string, topK = 
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, conversation_id: conversationId, stream: false, top_k: topK }),
+    body: JSON.stringify({ question, conversation_id: conversationId, top_k: topK }),
   })
   if (!res.ok) throw new Error("Query failed")
   return res.json()
