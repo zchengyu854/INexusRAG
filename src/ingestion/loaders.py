@@ -9,7 +9,12 @@ import pymupdf  # fitz
 
 
 def _clean(text: str) -> str:
-    """压缩空白，保留段落分隔。"""
+    """压缩空白，保留段落分隔；剔除 NUL 等控制字符。
+
+    PDF 提取时常带 NUL(0x00)，而 PostgreSQL 的 text 列拒收 NUL，整篇文档会入库失败
+    （报错信息“cannot contain NUL”与用户操作完全无关联，很难定位）。
+    """
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
