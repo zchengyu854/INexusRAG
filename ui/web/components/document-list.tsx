@@ -80,15 +80,15 @@ export function DocumentList() {
 
   return (
     <div className="mx-auto max-w-[1100px]">
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-semibold tracking-tight">Documents</h2>
-          <p className="mt-1 text-sm text-muted-foreground">
-            PDF, Markdown, and TXT files are split into chunks and indexed locally.
-          </p>
+      <div className="mb-8 flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-semibold tracking-tight">Documents</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              PDF, Markdown, and TXT files are split into chunks and indexed locally.
+            </p>
+          </div>
+          <UploadButton onUpload={handleUpload} loading={uploading} />
         </div>
-        <UploadButton onUpload={handleUpload} loading={uploading} />
-      </div>
 
       {error && (
         <Alert variant="destructive" className="mb-4">
@@ -97,7 +97,10 @@ export function DocumentList() {
       )}
 
       {docs.length === 0 ? (
-        <div className="py-20 text-center">
+        <div className="py-24 text-center">
+          <div className="mx-auto mb-4 flex size-12 items-center justify-center rounded-2xl bg-primary/10">
+            <Upload className="size-5 text-primary" />
+          </div>
           <p className="text-lg font-medium">No documents yet</p>
           <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
             Upload a file to build your knowledge base. Indexing takes a few seconds.

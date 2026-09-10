@@ -5,7 +5,7 @@ import { clearConversation, getConversationMessages, getConversations, queryDoc,
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Bot, Search, Send, SlidersHorizontal, FileText, Loader2, AlertCircle, Trash2, Plus, MessageSquare, Files } from "lucide-react"
+import { Bot, MessageCircle, Search, Send, SlidersHorizontal, FileText, Loader2, AlertCircle, Trash2, Plus, MessageSquare, Files } from "lucide-react"
 import { Input } from "@/components/ui/input"
 
 interface Message {
@@ -247,7 +247,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
             <button
               key={conversation.id}
               onClick={() => selectConversation(conversation.id)}
-              className={`w-full rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-muted ${conversation.id === selectedConversationId ? "bg-muted font-medium" : ""}`}
+              className={`w-full rounded-md px-3 py-2 text-left text-sm transition-all hover:bg-muted ${conversation.id === selectedConversationId ? "bg-muted font-medium shadow-[inset_3px_0_0_var(--primary)]" : ""}`}
             >
               <div className="flex items-start gap-2">
                 <MessageSquare className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
@@ -271,6 +271,9 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
           <div className="mx-auto flex min-h-full max-w-3xl flex-col space-y-6">
             {messages.length === 0 && !loading && !error && (
               <div className="flex flex-1 flex-col items-center justify-center py-16 text-center">
+                <div className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-primary/10">
+                  <MessageCircle className="size-5 text-primary" />
+                </div>
                 <h2 className="text-xl font-semibold tracking-tight">Ask anything about your documents</h2>
                 <p className="mt-2 max-w-md text-sm text-muted-foreground">
                   Answers are grounded in your knowledge base and cite their sources.
@@ -317,7 +320,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
 
         <div className="shrink-0 border-t bg-card p-4">
           <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
-            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="Retrieval features">
+            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="Retrieval features" className="transition-colors hover:bg-muted/80">
               <SlidersHorizontal className="size-3.5" /> Features
             </Button>
             <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
@@ -354,7 +357,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
               rows={1}
               disabled={loading}
             />
-            <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg">
+            <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg" className="transition-transform hover:scale-[1.03] active:scale-[0.97]">
               {loading ? <Loader2 className="size-5 animate-spin" /> : <Send className="size-5" />}
             </Button>
           </div>

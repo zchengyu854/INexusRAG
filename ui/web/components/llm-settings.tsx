@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Check, Eye, EyeOff, Plus, Trash2 } from "lucide-react"
+import { Check, Cpu, Eye, EyeOff, Plus, Trash2 } from "lucide-react"
 import {
   activateProvider,
   deleteProvider,
@@ -170,7 +170,10 @@ export function LLMSettings({ onChanged }: { onChanged?: () => void }) {
       )}
 
       {rows.length === 0 ? (
-        <div className="py-20 text-center">
+        <div className="py-24 text-center">
+          <div className="mx-auto mb-4 flex size-12 items-center justify-center rounded-2xl bg-primary/10">
+            <Cpu className="size-5 text-primary" />
+          </div>
           <p className="text-lg font-medium">No LLM providers yet</p>
           <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
             Add a provider with a name, model, base URL, and API key.
