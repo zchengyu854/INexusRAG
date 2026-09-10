@@ -43,6 +43,16 @@ class RerankTests(unittest.TestCase):
     def test_rerank_empty_candidates(self):
         self.assertEqual(rerank("q", [], 5), [])
 
+    def test_colbert_missing_model_gives_clear_error(self):
+        import src.rerank as R
+        with patch.dict("os.environ", {"RERANK_STRATEGY": "colbert"}), \
+             patch.object(R, "_colbert", None, create=True):
+            R._colbert = None
+            R._COLBERT_MODEL = "/nonexistent/colbert"
+            with self.assertRaises(FileNotFoundError):
+                rerank("q", [cand(0)], 1)
+            R._COLBERT_MODEL = "models/colbert"
+
     def test_default_strategy_is_rrf(self):
         with patch.dict("os.environ", {"RERANK_STRATEGY": "rrf"}):
             out = rerank("q", [cand(0), cand(1)], 2)  # rrf：score 0.2 > 0.1
