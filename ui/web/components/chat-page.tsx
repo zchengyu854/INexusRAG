@@ -23,12 +23,12 @@ const CONVERSATION_KEY = "nexus-rag-conversation-id"
 const LAST_FEATURES_KEY = "nexus-rag-last-features"
 
 const FEATURE_OPTIONS: { key: string; label: string; desc: string }[] = [
-  { key: "routing", label: "Routing", desc: "Route to target documents first, narrowing the search" },
-  { key: "keywords", label: "Keywords", desc: "Exact-match terms (names, codes, numbers)" },
-  { key: "decompose", label: "Decompose", desc: "Split complex questions into sub-questions" },
-  { key: "stepback", label: "Step-back", desc: "Restate detail questions as conceptual ones first" },
-  { key: "hyde", label: "HyDE", desc: "Hypothetical answer passage to aid semantic search" },
-  { key: "rerank", label: "Rerank", desc: "Fine-rank candidates at the end of retrieval (slower)" },
+  { key: "routing", label: "路由", desc: "先定位到相关文档，缩小检索范围" },
+  { key: "keywords", label: "关键词", desc: "精确匹配专有名词、代号、数字" },
+  { key: "decompose", label: "分解", desc: "将复杂问题拆分为子问题分别检索" },
+  { key: "stepback", label: "退步", desc: "先将细节问题转化为概念问题再检索" },
+  { key: "hyde", label: "假想文档", desc: "生成假想答案段落辅助语义检索" },
+  { key: "rerank", label: "重排", desc: "检索末端对候选结果精细排序（稍慢）" },
   { key: "graph", label: "图谱", desc: "图谱多跳检索，串联分散在文档各处的关系线索" },
 ]
 
@@ -227,7 +227,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
 
   return (
     <div className="flex h-full min-h-0 gap-0 overflow-hidden rounded-lg border bg-card">
-      <aside className="hidden w-64 shrink-0 border-r bg-muted/30 md:flex md:flex-col">
+      <aside className="hidden w-52 shrink-0 border-r bg-muted/30 md:flex md:flex-col">
         <div className="flex items-center justify-between border-b p-3">
           <span className="text-sm font-medium">History</span>
           <Button variant="ghost" size="icon" onClick={newConversation} disabled={loading} title="New conversation">
@@ -268,7 +268,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
 
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
-          <div className="mx-auto flex min-h-full max-w-3xl flex-col space-y-6">
+          <div className="mx-auto flex min-h-full max-w-4xl flex-col space-y-6">
             {messages.length === 0 && !loading && !error && (
               <div className="flex flex-1 flex-col items-center justify-center py-16 text-center">
                 <div className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-primary/10">
@@ -319,34 +319,37 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) 
         </div>
 
         <div className="shrink-0 border-t bg-card p-4">
-          <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
-            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="Retrieval features" className="transition-colors hover:bg-muted/80">
-              <SlidersHorizontal className="size-3.5" /> Features
-            </Button>
+          <div className="mx-auto flex max-w-4xl items-center justify-between pb-2">
+            <div className="relative">
+              <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="检索特性" className="transition-colors hover:bg-muted/80">
+                <SlidersHorizontal className="size-3.5" /> 检索特性
+              </Button>
+              {showFeatures && (
+                <div className="absolute bottom-full left-0 z-50 mb-2 w-80 rounded-xl border bg-popover p-3 shadow-[0_12px_40px_rgba(0,0,0,0.5)]">
+                  <p className="mb-2 text-xs font-medium text-muted-foreground">检索特性</p>
+                  <div className="space-y-0.5">
+                    {FEATURE_OPTIONS.map((o) => (
+                      <label key={o.key} className="flex cursor-pointer items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors hover:bg-muted" title={o.key}>
+                        <input
+                          type="checkbox"
+                          checked={checked[o.key]}
+                          onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
+                          className="size-3.5 rounded border-muted-foreground/40 accent-primary"
+                        />
+                        <span className="w-16 text-xs font-medium">{o.label}</span>
+                        <span className="text-[11px] leading-tight text-muted-foreground">{o.desc}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
             <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
               <Trash2 className="mr-1 size-4" />
               Clear
             </Button>
           </div>
-          {showFeatures && (
-            <div className="mx-auto mb-2 w-full max-w-3xl space-y-0.5 rounded-md border bg-muted/30 p-2">
-              <div className="px-1 pb-1">
-                <span className="text-xs font-medium text-muted-foreground">Retrieval features</span>
-              </div>
-              {FEATURE_OPTIONS.map((o) => (
-                <label key={o.key} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-muted" title={o.key}>
-                  <input
-                    type="checkbox"
-                    checked={checked[o.key]}
-                    onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
-                  />
-                  <span className="w-20 text-xs font-medium">{o.label}</span>
-                  <span className="text-[11px] text-muted-foreground">{o.desc}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          <div className="mx-auto flex max-w-3xl gap-2">
+          <div className="mx-auto flex max-w-4xl gap-2">
             <textarea
               ref={inputRef}
               value={input}
@@ -387,7 +390,7 @@ function MessageBubble({ message }: { message: Message }) {
           <Bot className="size-4 text-primary" />
         </AvatarFallback>
       </Avatar>
-      <div className="min-w-0 flex-1 space-y-2">
+      <div className="min-w-0 flex-1 space-y-2 rounded-xl bg-muted/30 px-4 py-3">
         <p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed">{message.content}</p>
 
         {message.figures && message.figures.length > 0 && (
