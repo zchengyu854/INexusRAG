@@ -14,10 +14,22 @@ interface Message {
   role: "user" | "assistant"
   content: string
   sources?: Source[]
+  features?: string[]
   timestamp: Date
 }
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
+
+const FEATURE_OPTIONS: { key: string; label: string }[] = [
+  { key: "routing", label: "路由" },
+  { key: "keywords", label: "关键词" },
+  { key: "decompose", label: "分解" },
+  { key: "stepback", label: "退步" },
+  { key: "hyde", label: "假想文档" },
+  { key: "rerank", label: "重排" },
+]
+
+const DEFAULT_FEATURES = ["routing", "keywords", "decompose", "stepback", "hyde"]
 
 function getConversationId() {
   const existing = window.localStorage.getItem(CONVERSATION_KEY)
@@ -40,6 +52,10 @@ export function ChatPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [progress, setProgress] = useState(0)
+  const [showFeatures, setShowFeatures] = useState(false)
+  const [checked, setChecked] = useState<Record<string, boolean>>(
+    Object.fromEntries([...DEFAULT_FEATURES, "rerank"].map((k) => [k, k !== "rerank"]))
+  )
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -98,6 +114,15 @@ export function ChatPage() {
     setConversations(await getConversations())
   }
 
+  function computeFeatures() {
+    const selected = FEATURE_OPTIONS.filter((o) => checked[o.key]).map((o) => o.key)
+    const isDefault =
+      selected.length === DEFAULT_FEATURES.length && DEFAULT_FEATURES.every((f) => selected.includes(f))
+    // 默认组合或全部取消 = 不传（后端默认）
+    if (isDefault || selected.length === 0) return undefined
+    return selected
+  }
+
   async function handleSend() {
     const question = input.trim()
     if (!question || loading) return
@@ -123,7 +148,8 @@ export function ChatPage() {
     }, 300)
 
     try {
-      const result = await queryDoc(question, conversationId)
+      const featuresSent = computeFeatures()
+      const result = await queryDoc(question, conversationId, 5, undefined, featuresSent)
       clearInterval(progressInterval)
       setProgress(100)
 
@@ -132,6 +158,7 @@ export function ChatPage() {
         role: "assistant",
         content: result.answer,
         sources: result.sources || [],
+        features: featuresSent,
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, assistantMsg])
@@ -249,12 +276,32 @@ export function ChatPage() {
         {/* Input */}
       <div className="shrink-0 border-t bg-card p-4">
         <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
-          <span className="text-xs text-muted-foreground">Saved to database</span>
+          <div className="flex items-center gap-2">
+            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="检索特性">
+              特性
+            </Button>
+            <span className="text-xs text-muted-foreground">Saved to database</span>
+          </div>
           <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
             <Trash2 className="size-4 mr-1" />
             Clear
           </Button>
         </div>
+        {showFeatures && (
+          <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/30 p-2">
+            <span className="text-xs font-medium">检索特性</span>
+            {FEATURE_OPTIONS.map((o) => (
+              <label key={o.key} title={o.key} className="flex cursor-pointer items-center gap-1.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={checked[o.key]}
+                  onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
+                />
+                <span>{o.label}</span>
+              </label>
+            ))}
+          </div>
+        )}
         <div className="mx-auto flex max-w-3xl gap-2">
           <textarea
             ref={inputRef}
@@ -306,6 +353,12 @@ function MessageBubble({ message }: { message: Message }) {
               <SourceChip key={i} source={source} />
             ))}
           </div>
+        )}
+
+        {!isUser && (
+          <p className="text-[11px] text-muted-foreground">
+            本次检索特性: {message.features ? message.features.join("·") : "默认"}
+          </p>
         )}
       </div>
     </div>

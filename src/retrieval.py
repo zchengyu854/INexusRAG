@@ -75,13 +75,16 @@ _ROUTE_TOP = 3
 _MIN_ROUTE_SCORE = 0.3  # ponytail: 余弦阈值未校准（bge-m3），观测到路由漏检后调
 
 
-def two_stage_search(query_embedding: list[float], top_k: int, terms: list[str], filters: dict | None = None) -> list[dict]:
-    """两级检索：先路由命中目标文档，再在目标文档内检索；关键词通道全局兑底。"""
-    routed = search_doc_index(query_embedding, top_k=_ROUTE_TOP)
+def two_stage_search(query_embedding: list[float], top_k: int, terms: list[str], filters: dict | None = None, use_routing: bool = True) -> list[dict]:
+    """两级检索：先路由命中目标文档，再在目标文档内检索；关键词通道全局兑底。use_routing=False 时只做全局向量检索。"""
     limit = max(top_k * 5, 25)
     channels: list[list[dict]] = []
     if terms:
         channels.append(keyword_chunks(terms, limit=limit, filters=filters))
+    if not use_routing:
+        channels.append(search_chunks(query_embedding, top_k=limit, filters=filters))
+        return rrf_merge(channels, top_k) if channels else []
+    routed = search_doc_index(query_embedding, top_k=_ROUTE_TOP)
     if routed:
         for row in routed:
             channels.append(search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters))
@@ -138,20 +141,35 @@ def plan_question(question: str) -> dict:
         return empty
 
 
-def multi_query_search(question: str, top_k: int, filters: dict | None = None) -> list[dict]:
-    """多查询：LLM 规划（分解/退步/HyDE，单次调用门控）→ 各通道两级检索 → RRF 合并去重。"""
+ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rerank")
+_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")  # rerank 默认关，消融时显式传 features
+
+
+def multi_query_search(question: str, top_k: int, filters: dict | None = None, features: list[str] | None = None) -> list[dict]:
+    """多查询：features 控制通道开关（None = 默认全开除 rerank）→ 两级检索 → RRF → 可选 rerank。"""
     from src.ingestion.embedder import get_embedder
 
-    plan = plan_question(question)
-    queries = [question, *[s for s in plan["subs"] if s != question]]
-    if plan["step_back"] and plan["step_back"] != question:
+    active = set(_DEFAULT_FEATURES) if features is None else set(features)
+    # 只有启用规划类特性才付 LLM 规划调用
+    plan = plan_question(question) if {"decompose", "stepback", "hyde"} & active else {"subs": [], "step_back": None, "hyde": None}
+    queries = [question]
+    if "decompose" in active:
+        queries += [s for s in plan["subs"] if s != question]
+    if "stepback" in active and plan["step_back"] and plan["step_back"] != question:
         queries.append(plan["step_back"])
     vectors = get_embedder().encode(queries)
+    use_routing = "routing" in active
     channels = [
-        two_stage_search(vec, top_k=top_k, terms=extract_terms(q), filters=filters)
+        two_stage_search(vec, top_k=top_k,
+                         terms=(extract_terms(q) if "keywords" in active else []),
+                         filters=filters, use_routing=use_routing)
         for q, vec in zip(queries, vectors)
     ]
-    if plan["hyde"]:
+    if "hyde" in active and plan["hyde"]:
         hyde_vec = get_embedder().encode([plan["hyde"]])[0]
-        channels.append(two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters))
-    return rrf_merge(channels, top_k)
+        channels.append(two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing))
+    merged = rrf_merge(channels, top_k if "rerank" not in active else top_k * 5)
+    if "rerank" in active and merged:
+        from src.rerank import rerank
+        merged = rerank(question, merged, top_k)
+    return merged
