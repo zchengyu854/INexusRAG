@@ -9,7 +9,7 @@ import json
 import os
 
 _MODEL_NAME = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
-_COLBERT_MODEL = os.getenv("COLBERT_MODEL", "castorini/colbert-ir")
+_COLBERT_MODEL = os.getenv("COLBERT_MODEL", "models/colbert")  # 需先 `snapshot_download castorini/tct_colbert-v2-msmarco` 到此目录
 
 _reranker = None
 _colbert = None
@@ -58,12 +58,35 @@ def _score_llm(query: str, candidates: list[dict]) -> list[float]:
 
 
 def _score_colbert(query: str, candidates: list[dict]) -> list[float]:
-    """ColBERT MaxSim：token 级 max-over-tokens 余弦和；ponytail: 英文模型默认，中文换 XLM-R 系 colbert。"""
+    """ColBERT 真 Late Interaction：token 级 MaxSim；ponytail: 需预下载模型到 models/colbert。"""
     global _colbert
     if _colbert is None:
-        from sentence_transformers import CrossEncoder
-        _colbert = CrossEncoder(_COLBERT_MODEL, local_files_only=False)
-    return list(_colbert.predict([[query, c["text"]] for c in candidates]))
+        if not os.path.isdir(_COLBERT_MODEL) or not os.path.exists(os.path.join(_COLBERT_MODEL, "config.json")):
+            raise FileNotFoundError(
+                f"ColBERT 模型目录 {_COLBERT_MODEL} 不存在。先下载："
+                "HF_ENDPOINT=https://hf-mirror.com 用 huggingface_hub.snapshot_download 拉 castorini/tct_colbert-v2-hn-msmarco 到此目录")
+        from colbert import Checkpoint
+        from colbert.modeling.colbert import colbert_score
+        from colbert.searcher import ColBERTConfig
+
+        cfg = ColBERTConfig()
+        cfg.configure(checkpoint=_COLBERT_MODEL)
+        checkpoint = Checkpoint(_COLBERT_MODEL, colbert_config=cfg)
+
+        def encode_docs(texts):
+            input_ids, attention_mask = checkpoint.doc_tokenizer.tensorize(texts)
+            D, mask = checkpoint.doc(input_ids, attention_mask, keep_dims="return_mask", to_cpu=True)
+            return D, mask
+
+        def encode_query(text):
+            return checkpoint.queryFromText([text], bsize=1, to_cpu=True)
+
+        _colbert = (colbert_score, encode_docs, encode_query, cfg)
+
+    colbert_score, encode_docs, encode_query, cfg = _colbert
+    Q = encode_query(query)
+    D, mask = encode_docs([c["text"] for c in candidates])
+    return [float(s) for s in colbert_score(Q, D, mask, config=cfg).tolist()]
 
 
 _STRATEGIES = {"rrf": _score_rrf, "cross": _score_cross, "llm": _score_llm, "colbert": _score_colbert}

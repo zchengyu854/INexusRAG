@@ -64,3 +64,4 @@ ui/web/node_modules/
 ui/web/.next/
 ui/web/.pnp.*
 ui/web/package-lock.json
+models/

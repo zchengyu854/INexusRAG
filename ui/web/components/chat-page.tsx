@@ -19,14 +19,15 @@ interface Message {
 }
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
+const LAST_FEATURES_KEY = "nexus-rag-last-features"
 
-const FEATURE_OPTIONS: { key: string; label: string }[] = [
-  { key: "routing", label: "Routing" },
-  { key: "keywords", label: "Keywords" },
-  { key: "decompose", label: "Decompose" },
-  { key: "stepback", label: "Step-back" },
-  { key: "hyde", label: "HyDE" },
-  { key: "rerank", label: "Rerank" },
+const FEATURE_OPTIONS: { key: string; label: string; desc: string }[] = [
+  { key: "routing", label: "Routing", desc: "Route to target documents first, narrowing the search" },
+  { key: "keywords", label: "Keywords", desc: "Exact-match terms (names, codes, numbers)" },
+  { key: "decompose", label: "Decompose", desc: "Split complex questions into sub-questions" },
+  { key: "stepback", label: "Step-back", desc: "Restate detail questions as conceptual ones first" },
+  { key: "hyde", label: "HyDE", desc: "Hypothetical answer passage to aid semantic search" },
+  { key: "rerank", label: "Rerank", desc: "Fine-rank candidates at the end of retrieval (slower)" },
 ]
 
 const DEFAULT_FEATURES = ["routing", "keywords", "decompose", "stepback", "hyde"]
@@ -56,9 +57,21 @@ function featureLabels(keys: string[] | undefined) {
   return keys.map((k) => FEATURE_OPTIONS.find((o) => o.key === k)?.label ?? k).join(", ")
 }
 
+function getLastFeatures(): string[] | null {
+  try {
+    const raw = window.localStorage.getItem(LAST_FEATURES_KEY)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as string[]) : null
+  } catch {
+    return null
+  }
+}
+
 function messageMeta(message: Message) {
+  const features = message.features ?? getLastFeatures() ?? undefined
   return [
-    featureLabels(message.features) ? `features: ${featureLabels(message.features)}` : null,
+    featureLabels(features) ? `features: ${featureLabels(features)}` : null,
     message.latency_ms != null ? `${(message.latency_ms / 1000).toFixed(1)}s` : null,
   ].filter(Boolean) as string[]
 }
@@ -167,6 +180,8 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
 
     try {
       const featuresSent = computeFeatures()
+      // ponytail: 历史记录无 per-message features，用最后一次发送的值近似展示
+      window.localStorage.setItem(LAST_FEATURES_KEY, JSON.stringify(featuresSent))
       const result = await queryDoc(question, conversationId, 5, undefined, featuresSent)
 
       const assistantMsg: Message = {
@@ -308,16 +323,19 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
             </Button>
           </div>
           {showFeatures && (
-            <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/30 p-2">
-              <span className="text-xs font-medium text-muted-foreground">Retrieval features</span>
+            <div className="mx-auto mb-2 w-full max-w-3xl space-y-0.5 rounded-md border bg-muted/30 p-2">
+              <div className="px-1 pb-1">
+                <span className="text-xs font-medium text-muted-foreground">Retrieval features</span>
+              </div>
               {FEATURE_OPTIONS.map((o) => (
-                <label key={o.key} title={o.key} className="flex cursor-pointer items-center gap-1.5 text-xs">
+                <label key={o.key} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-muted" title={o.key}>
                   <input
                     type="checkbox"
                     checked={checked[o.key]}
                     onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
                   />
-                  <span>{o.label}</span>
+                  <span className="w-20 text-xs font-medium">{o.label}</span>
+                  <span className="text-[11px] text-muted-foreground">{o.desc}</span>
                 </label>
               ))}
             </div>
