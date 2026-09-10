@@ -29,6 +29,7 @@ const FEATURE_OPTIONS: { key: string; label: string; desc: string }[] = [
   { key: "stepback", label: "Step-back", desc: "Restate detail questions as conceptual ones first" },
   { key: "hyde", label: "HyDE", desc: "Hypothetical answer passage to aid semantic search" },
   { key: "rerank", label: "Rerank", desc: "Fine-rank candidates at the end of retrieval (slower)" },
+  { key: "graph", label: "图谱", desc: "图谱多跳检索，串联分散在文档各处的关系线索" },
 ]
 
 const DEFAULT_FEATURES = ["routing", "keywords", "decompose", "stepback", "hyde"]
@@ -77,7 +78,7 @@ function messageMeta(message: Message) {
   ].filter(Boolean) as string[]
 }
 
-export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
+export function ChatPage({ onGoToDocuments }: { onGoToDocuments?: () => void }) {
   const conversationIdRef = useRef<string | null>(null)
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
@@ -88,7 +89,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
   const [error, setError] = useState<string | null>(null)
   const [showFeatures, setShowFeatures] = useState(false)
   const [checked, setChecked] = useState<Record<string, boolean>>(
-    Object.fromEntries([...DEFAULT_FEATURES, "rerank"].map((k) => [k, k !== "rerank"]))
+    Object.fromEntries(FEATURE_OPTIONS.map((o) => [o.key, DEFAULT_FEATURES.includes(o.key)]))
   )
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -274,7 +275,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
                 <p className="mt-2 max-w-md text-sm text-muted-foreground">
                   Answers are grounded in your knowledge base and cite their sources.
                 </p>
-                <Button className="mt-6" onClick={onGoToDocuments}>
+                <Button className="mt-6" onClick={() => onGoToDocuments?.()}>
                   <Files /> Open Documents
                 </Button>
               </div>

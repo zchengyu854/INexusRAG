@@ -27,37 +27,32 @@
   --radius-sm: calc(var(--radius) - 4px);
   --font-sans: var(--font-outfit);
   --font-mono: var(--font-geist-mono);
-  --animate-fade-up: fade-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
-  --animate-fade-in: fade-in 0.4s ease-out both;
+  --animate-fade-up: fade-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-fade-in: fade-in 0.3s ease-out both;
   --animate-pulse-soft: pulse-soft 1.6s ease-in-out infinite;
-  --animate-marquee: marquee 28s linear infinite;
 }
 
-/*
-  Locked dark theme (no light mode).
-  Near-black cool base + single ember accent. No pure #000 / #fff.
-*/
 :root,
 .dark {
-  --radius: 0.75rem;
+  --radius: 0.625rem;
   --background: oklch(0.15 0.014 265);
   --foreground: oklch(0.93 0.004 260);
-  --card: oklch(0.2 0.014 265);
+  --card: oklch(0.19 0.014 265);
   --card-foreground: oklch(0.93 0.004 260);
-  --popover: oklch(0.22 0.016 265);
+  --popover: oklch(0.21 0.016 265);
   --popover-foreground: oklch(0.93 0.004 260);
   --primary: oklch(0.68 0.19 45);
   --primary-foreground: oklch(0.15 0.02 45);
-  --secondary: oklch(0.24 0.014 265);
+  --secondary: oklch(0.23 0.014 265);
   --secondary-foreground: oklch(0.93 0.004 260);
-  --muted: oklch(0.23 0.014 265);
-  --muted-foreground: oklch(0.63 0.018 260);
-  --accent: oklch(0.27 0.05 45);
+  --muted: oklch(0.22 0.014 265);
+  --muted-foreground: oklch(0.58 0.018 260);
+  --accent: oklch(0.26 0.05 45);
   --accent-foreground: oklch(0.78 0.15 50);
   --destructive: oklch(0.62 0.2 25);
   --destructive-foreground: oklch(0.97 0 0);
-  --border: oklch(1 0 0 / 0.12);
-  --input: oklch(1 0 0 / 0.16);
+  --border: oklch(1 0 0 / 0.1);
+  --input: oklch(1 0 0 / 0.14);
   --ring: oklch(0.68 0.19 45);
 }
 
@@ -73,58 +68,33 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Ambient layers: deep radial washes + fixed grain. Grain lives on a
-   pointer-events-none fixed layer only (no repaint cost on scroll). */
 .ambient {
   background:
-    radial-gradient(56rem 38rem at 14% -8%, oklch(0.68 0.19 45 / 0.16), transparent 62%),
-    radial-gradient(72rem 52rem at 102% 108%, oklch(0.55 0.2 265 / 0.2), transparent 60%);
+    radial-gradient(48rem 32rem at 12% -6%, oklch(0.68 0.19 45 / 0.1), transparent 58%),
+    radial-gradient(56rem 40rem at 100% 110%, oklch(0.55 0.2 265 / 0.12), transparent 55%);
 }
 
 .grain {
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix type='saturate' values='0'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='0.5'/></svg>");
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix type='saturate' values='0'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='0.4'/></svg>");
 }
 
 @keyframes fade-up {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 @keyframes pulse-soft {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
-  }
-}
-
-@keyframes marquee {
-  to {
-    transform: translateX(-50%);
-  }
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
+  *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
