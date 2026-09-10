@@ -155,7 +155,7 @@ export async function queryDoc(
   topK = 5,
   filters?: Record<string, string | number | boolean>,
   features?: string[]
-): Promise<{ answer: string; sources: Source[]; conversation_id: string }> {
+): Promise<{ answer: string; sources: Source[]; conversation_id: string; latency_ms: number }> {
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -186,6 +186,13 @@ export async function fetchProviders(): Promise<LLMProvider[]> {
   const res = await fetch(`${API_BASE}/llm/providers`)
   if (!res.ok) throw new Error("Failed to fetch LLM providers")
   return res.json()
+}
+
+export async function getActiveProvider(): Promise<LLMProvider | null> {
+  const res = await fetch(`${API_BASE}/llm/active`)
+  if (!res.ok) return null
+  const data = await res.json()
+  return data.provider ?? null
 }
 
 export async function upsertProvider(draft: LLMProviderDraft): Promise<LLMProvider> {

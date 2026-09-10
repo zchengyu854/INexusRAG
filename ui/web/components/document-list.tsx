@@ -4,10 +4,10 @@ import React from "react"
 import { useState, useEffect, useCallback } from "react"
 import { fetchDocs, uploadFile, ingestDocument, deleteDocument } from "@/lib/api"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Upload, FileText, ArrowUpRight, Trash2, Loader2 } from "lucide-react"
 import { DocumentViewer } from "./document-viewer"
 
 interface Doc {
@@ -25,8 +25,7 @@ export function DocumentList() {
 
   const loadDocs = useCallback(async () => {
     try {
-      const data = await fetchDocs()
-      setDocs(data)
+      setDocs(await fetchDocs())
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load documents")
@@ -80,42 +79,82 @@ export function DocumentList() {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xl font-semibold">Documents</h2>
+    <div className="mx-auto max-w-[1100px]">
+      <div className="mb-6 flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight">Documents</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            PDF, Markdown, and TXT files are split into chunks and indexed locally.
+          </p>
+        </div>
         <UploadButton onUpload={handleUpload} loading={uploading} />
       </div>
 
       {error && (
-        <Alert variant="destructive">
+        <Alert variant="destructive" className="mb-4">
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
 
       {docs.length === 0 ? (
-        <div className="text-center py-12 text-muted-foreground">
-          <p className="text-lg">No documents yet</p>
-          <p className="text-sm mt-1">Upload a PDF, Markdown, or TXT file to get started</p>
+        <div className="py-20 text-center">
+          <p className="text-lg font-medium">No documents yet</p>
+          <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
+            Upload a file to build your knowledge base. Indexing takes a few seconds.
+          </p>
+          <Button className="mt-5" onClick={() => document.getElementById("doc-upload")?.click()}>
+            <Upload /> Upload your first file
+          </Button>
         </div>
       ) : (
-        <div className="grid gap-4">
-          {docs.map((doc) => (
-            <Card
-              key={doc.id}
-              className="cursor-pointer hover:border-primary/50 transition-colors"
-              onClick={() => setSelectedDoc(doc)}
-            >
-              <CardContent className="p-4 flex items-center justify-between">
-                <div className="flex-1 min-w-0">
-                  <p className="font-medium truncate">{doc.filename}</p>
-                  <p className="text-sm text-muted-foreground">
-                    {doc.chunks} chunks
-                  </p>
+        <div className="overflow-hidden rounded-lg border bg-card">
+          <div className="grid grid-cols-[1fr_auto_auto_120px] items-center gap-4 border-b bg-muted/30 px-4 py-2.5 text-xs font-medium text-muted-foreground">
+            <span>File</span>
+            <span className="w-20 text-right">Chunks</span>
+            <span className="w-24">Status</span>
+            <span />
+          </div>
+          <ul className="divide-y">
+            {docs.map((doc) => (
+              <li
+                key={doc.id}
+                className="grid cursor-pointer grid-cols-[1fr_auto_auto_120px] items-center gap-4 px-4 py-3 transition-colors hover:bg-muted/50"
+                onClick={() => setSelectedDoc(doc)}
+              >
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <FileText className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="truncate font-medium">{doc.filename}</span>
                 </div>
-                <StatusBadge status={doc.status} />
-              </CardContent>
-            </Card>
-          ))}
+                <span className="w-20 text-right font-mono text-sm text-muted-foreground">
+                  {doc.chunks || "-"}
+                </span>
+                <span className="w-24"><StatusBadge status={doc.status} /></span>
+                <div className="flex justify-end gap-1" onClick={(e) => e.stopPropagation()}>
+                  {doc.status === "indexing" && (
+                    <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="Indexing" />
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-7 text-muted-foreground"
+                    onClick={() => setSelectedDoc(doc)}
+                    title="Open"
+                  >
+                    <ArrowUpRight className="size-3.5" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-7 text-muted-foreground hover:text-destructive"
+                    onClick={() => handleDelete(doc.id)}
+                    title="Delete"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </Button>
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </div>
@@ -123,14 +162,25 @@ export function DocumentList() {
 }
 
 function StatusBadge({ status }: { status: string }) {
-  const config = {
-    ready: { label: "Ready", variant: "default" as const },
-    indexing: { label: "Indexing", variant: "secondary" as const },
-    failed: { label: "Failed", variant: "destructive" as const },
-    pending: { label: "Pending", variant: "outline" as const },
-  }[status] || { label: status, variant: "outline" as const }
-
-  return <Badge variant={config.variant}>{config.label}</Badge>
+  if (status === "ready")
+    return (
+      <Badge variant="secondary" className="bg-primary/10 font-normal text-primary hover:bg-primary/10">
+        Ready
+      </Badge>
+    )
+  if (status === "indexing")
+    return (
+      <Badge variant="secondary" className="font-normal text-amber-600 dark:text-amber-400">
+        Indexing
+      </Badge>
+    )
+  if (status === "failed")
+    return (
+      <Badge variant="destructive" className="font-normal">
+        Failed
+      </Badge>
+    )
+  return <Badge variant="outline">{status}</Badge>
 }
 
 function UploadButton({ onUpload, loading }: { onUpload: (file: File) => void; loading: boolean }) {
@@ -139,6 +189,7 @@ function UploadButton({ onUpload, loading }: { onUpload: (file: File) => void; l
   return (
     <>
       <Input
+        id="doc-upload"
         ref={inputRef}
         type="file"
         accept=".pdf,.md,.markdown,.txt"
@@ -150,7 +201,8 @@ function UploadButton({ onUpload, loading }: { onUpload: (file: File) => void; l
         }}
       />
       <Button onClick={() => inputRef.current?.click()} disabled={loading}>
-        {loading ? "Uploading file..." : "+ Upload Document"}
+        {loading ? <Loader2 className="size-4 animate-spin" /> : <Upload className="size-4" />}
+        {loading ? "Uploading…" : "Upload document"}
       </Button>
     </>
   )

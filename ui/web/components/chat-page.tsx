@@ -3,11 +3,10 @@
 import { useState, useRef, useEffect } from "react"
 import { clearConversation, getConversationMessages, getConversations, queryDoc, type ConversationSummary, type Source } from "@/lib/api"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
-import { Send, Bot, User, FileText, Search, Loader2, AlertCircle, Trash2, Plus, MessageSquare } from "lucide-react"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { Bot, Search, Send, SlidersHorizontal, FileText, Loader2, AlertCircle, Trash2, Plus, MessageSquare, Files } from "lucide-react"
+import { Input } from "@/components/ui/input"
 
 interface Message {
   id: string
@@ -15,18 +14,19 @@ interface Message {
   content: string
   sources?: Source[]
   features?: string[]
+  latency_ms?: number
   timestamp: Date
 }
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
 
 const FEATURE_OPTIONS: { key: string; label: string }[] = [
-  { key: "routing", label: "路由" },
-  { key: "keywords", label: "关键词" },
-  { key: "decompose", label: "分解" },
-  { key: "stepback", label: "退步" },
-  { key: "hyde", label: "假想文档" },
-  { key: "rerank", label: "重排" },
+  { key: "routing", label: "Routing" },
+  { key: "keywords", label: "Keywords" },
+  { key: "decompose", label: "Decompose" },
+  { key: "stepback", label: "Step-back" },
+  { key: "hyde", label: "HyDE" },
+  { key: "rerank", label: "Rerank" },
 ]
 
 const DEFAULT_FEATURES = ["routing", "keywords", "decompose", "stepback", "hyde"]
@@ -43,15 +43,35 @@ function toMessage(message: { id: string; role: "user" | "assistant"; content: s
   return { ...message, timestamp: new Date(message.created_at) }
 }
 
-export function ChatPage() {
+function relTime(iso: string) {
+  const s = (Date.now() - new Date(iso).getTime()) / 1000
+  if (s < 60) return "just now"
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`
+  return `${Math.floor(s / 86400)}d ago`
+}
+
+function featureLabels(keys: string[] | undefined) {
+  if (!keys || keys.length === 0) return null
+  return keys.map((k) => FEATURE_OPTIONS.find((o) => o.key === k)?.label ?? k).join(", ")
+}
+
+function messageMeta(message: Message) {
+  return [
+    featureLabels(message.features) ? `features: ${featureLabels(message.features)}` : null,
+    message.latency_ms != null ? `${(message.latency_ms / 1000).toFixed(1)}s` : null,
+  ].filter(Boolean) as string[]
+}
+
+export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
   const conversationIdRef = useRef<string | null>(null)
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null)
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
+  const [filter, setFilter] = useState("")
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [progress, setProgress] = useState(0)
   const [showFeatures, setShowFeatures] = useState(false)
   const [checked, setChecked] = useState<Record<string, boolean>>(
     Object.fromEntries([...DEFAULT_FEATURES, "rerank"].map((k) => [k, k !== "rerank"]))
@@ -85,6 +105,10 @@ export function ChatPage() {
     el.style.height = "auto"
     el.style.height = Math.min(el.scrollHeight, 200) + "px"
   }, [input])
+
+  const visibleConversations = filter
+    ? conversations.filter((c) => c.title.toLowerCase().includes(filter.toLowerCase()))
+    : conversations
 
   async function selectConversation(id: string) {
     if (loading || id === conversationIdRef.current) return
@@ -127,8 +151,8 @@ export function ChatPage() {
     const question = input.trim()
     if (!question || loading) return
 
-    if (!conversationIdRef.current) return
     const conversationId = conversationIdRef.current
+    if (!conversationId) return
 
     const userMsg: Message = {
       id: Date.now().toString(),
@@ -140,18 +164,10 @@ export function ChatPage() {
     setInput("")
     setLoading(true)
     setError(null)
-    setProgress(5)
-
-    // Simulate progress
-    const progressInterval = setInterval(() => {
-      setProgress((p) => Math.min(p + 10, 90))
-    }, 300)
 
     try {
       const featuresSent = computeFeatures()
       const result = await queryDoc(question, conversationId, 5, undefined, featuresSent)
-      clearInterval(progressInterval)
-      setProgress(100)
 
       const assistantMsg: Message = {
         id: (Date.now() + 1).toString(),
@@ -159,6 +175,7 @@ export function ChatPage() {
         content: result.answer,
         sources: result.sources || [],
         features: featuresSent,
+        latency_ms: result.latency_ms,
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, assistantMsg])
@@ -166,15 +183,13 @@ export function ChatPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Query failed")
     } finally {
-      clearInterval(progressInterval)
       setLoading(false)
-      setProgress(0)
     }
   }
 
   async function handleClear() {
-    if (!conversationIdRef.current || loading) return
     const conversationId = conversationIdRef.current
+    if (!conversationId || loading) return
     try {
       await clearConversation(conversationId)
       setMessages([])
@@ -194,15 +209,23 @@ export function ChatPage() {
 
   return (
     <div className="flex h-full min-h-0 gap-0 overflow-hidden rounded-lg border bg-card">
-      <aside className="hidden w-64 shrink-0 border-r bg-muted/20 md:flex md:flex-col">
+      <aside className="hidden w-64 shrink-0 border-r bg-muted/30 md:flex md:flex-col">
         <div className="flex items-center justify-between border-b p-3">
           <span className="text-sm font-medium">History</span>
           <Button variant="ghost" size="icon" onClick={newConversation} disabled={loading} title="New conversation">
             <Plus className="size-4" />
           </Button>
         </div>
-        <div className="flex-1 space-y-1 overflow-y-auto p-2">
-          {conversations.map((conversation) => (
+        <div className="p-2">
+          <Input
+            value={filter}
+            placeholder="Search conversations"
+            onChange={(e) => setFilter(e.target.value)}
+            className="mb-2 h-8 bg-background"
+          />
+        </div>
+        <div className="flex-1 space-y-1 overflow-y-auto p-2 pt-0">
+          {visibleConversations.map((conversation) => (
             <button
               key={conversation.id}
               onClick={() => selectConversation(conversation.id)}
@@ -210,114 +233,111 @@ export function ChatPage() {
             >
               <div className="flex items-start gap-2">
                 <MessageSquare className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                <span className="line-clamp-2 break-words">{conversation.title}</span>
+                <div className="min-w-0 flex-1">
+                  <span className="line-clamp-2 break-words">{conversation.title}</span>
+                  <span className="mt-0.5 block font-mono text-[11px] text-muted-foreground">
+                    {conversation.message_count} messages · {relTime(conversation.updated_at)}
+                  </span>
+                </div>
               </div>
-              <span className="ml-6 text-xs text-muted-foreground">{conversation.message_count} messages</span>
             </button>
           ))}
-          {conversations.length === 0 && <p className="p-2 text-xs text-muted-foreground">No saved conversations</p>}
+          {conversations.length === 0 && (
+            <p className="px-2 py-3 text-xs text-muted-foreground">No saved conversations yet.</p>
+          )}
         </div>
       </aside>
 
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {/* Messages */}
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6">
-          <div className="mx-auto max-w-3xl space-y-6">
-        {messages.length === 0 && !loading && !error && (
-          <div className="flex h-[calc(100vh-24rem)] flex-col items-center justify-center text-center">
-            <div className="mb-4 flex size-16 items-center justify-center rounded-full bg-primary/10">
-              <Bot className="size-8 text-primary" />
-            </div>
-            <h2 className="text-lg font-semibold">Ask anything about your documents</h2>
-            <p className="mt-2 max-w-md text-muted-foreground">Upload documents first, then ask questions to get grounded answers from your knowledge base.</p>
-          </div>
-        )}
-
-        {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
-        ))}
-
-        {loading && (
-          <div className="space-y-2">
-            <div className="flex items-start gap-3">
-              <Avatar className="size-8 mt-1">
-                <AvatarFallback className="bg-primary/10">
-                  <Bot className="size-4 text-primary" />
-                </AvatarFallback>
-              </Avatar>
-              <div className="flex-1 space-y-2">
-                <Skeleton className="h-4 w-3/4" />
-                <Skeleton className="h-4 w-1/2" />
-                <Progress value={progress} className="h-1" />
+          <div className="mx-auto flex min-h-full max-w-3xl flex-col space-y-6">
+            {messages.length === 0 && !loading && !error && (
+              <div className="flex flex-1 flex-col items-center justify-center py-16 text-center">
+                <h2 className="text-xl font-semibold tracking-tight">Ask anything about your documents</h2>
+                <p className="mt-2 max-w-md text-sm text-muted-foreground">
+                  Answers are grounded in your knowledge base and cite their sources.
+                </p>
+                <Button className="mt-6" onClick={onGoToDocuments}>
+                  <Files /> Open Documents
+                </Button>
               </div>
-            </div>
-          </div>
-        )}
+            )}
 
-        {error && (
-          <div className="flex items-start gap-3">
-            <Avatar className="size-8 mt-1">
-              <AvatarFallback className="bg-destructive/10">
-                <AlertCircle className="size-4 text-destructive" />
-              </AvatarFallback>
-            </Avatar>
-            <Card className="border-destructive/50">
-              <CardContent className="p-3 text-sm text-destructive">
-                {error}
-              </CardContent>
-            </Card>
-          </div>
-        )}
-
-        <div ref={bottomRef} />
-          </div>
-        </div>
-
-        {/* Input */}
-      <div className="shrink-0 border-t bg-card p-4">
-        <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
-          <div className="flex items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="检索特性">
-              特性
-            </Button>
-            <span className="text-xs text-muted-foreground">Saved to database</span>
-          </div>
-          <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
-            <Trash2 className="size-4 mr-1" />
-            Clear
-          </Button>
-        </div>
-        {showFeatures && (
-          <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/30 p-2">
-            <span className="text-xs font-medium">检索特性</span>
-            {FEATURE_OPTIONS.map((o) => (
-              <label key={o.key} title={o.key} className="flex cursor-pointer items-center gap-1.5 text-xs">
-                <input
-                  type="checkbox"
-                  checked={checked[o.key]}
-                  onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
-                />
-                <span>{o.label}</span>
-              </label>
+            {messages.map((msg) => (
+              <MessageBubble key={msg.id} message={msg} />
             ))}
+
+            {loading && (
+              <div className="animate-fade-up flex items-start gap-3">
+                <Avatar className="size-8 mt-1 animate-pulse-soft">
+                  <AvatarFallback className="bg-primary/10">
+                    <Bot className="size-4 text-primary" />
+                  </AvatarFallback>
+                </Avatar>
+                <div className="flex-1 space-y-2 pt-1">
+                  <p className="text-xs text-muted-foreground">Searching your knowledge base…</p>
+                  <Skeleton className="h-4 w-4/5" />
+                  <Skeleton className="h-4 w-3/5" />
+                </div>
+              </div>
+            )}
+
+            {error && (
+              <div className="flex items-start gap-3">
+                <Avatar className="size-8 mt-1">
+                  <AvatarFallback className="bg-destructive/10">
+                    <AlertCircle className="size-4 text-destructive" />
+                  </AvatarFallback>
+                </Avatar>
+                <p className="pt-1 text-sm text-destructive">{error}</p>
+              </div>
+            )}
+
+            <div ref={bottomRef} />
           </div>
-        )}
-        <div className="mx-auto flex max-w-3xl gap-2">
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask a question... (Enter to send, Shift+Enter for new line)"
-            className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 min-h-[44px] max-h-[200px]"
-            rows={1}
-            disabled={loading}
-          />
-          <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg">
-            {loading ? <Loader2 className="size-5 animate-spin" /> : <Send className="size-5" />}
-          </Button>
         </div>
-      </div>
+
+        <div className="shrink-0 border-t bg-card p-4">
+          <div className="mx-auto flex max-w-3xl items-center justify-between pb-2">
+            <Button variant="ghost" size="sm" onClick={() => setShowFeatures((v) => !v)} aria-expanded={showFeatures} title="Retrieval features">
+              <SlidersHorizontal className="size-3.5" /> Features
+            </Button>
+            <Button variant="ghost" size="sm" onClick={handleClear} disabled={loading || messages.length === 0} title="Clear conversation">
+              <Trash2 className="mr-1 size-4" />
+              Clear
+            </Button>
+          </div>
+          {showFeatures && (
+            <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/30 p-2">
+              <span className="text-xs font-medium text-muted-foreground">Retrieval features</span>
+              {FEATURE_OPTIONS.map((o) => (
+                <label key={o.key} title={o.key} className="flex cursor-pointer items-center gap-1.5 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={checked[o.key]}
+                    onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
+                  />
+                  <span>{o.label}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          <div className="mx-auto flex max-w-3xl gap-2">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Ask a question… (Enter to send, Shift+Enter for a new line)"
+              className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 min-h-[44px] max-h-[200px]"
+              rows={1}
+              disabled={loading}
+            />
+            <Button onClick={handleSend} disabled={loading || !input.trim()} size="lg">
+              {loading ? <Loader2 className="size-5 animate-spin" /> : <Send className="size-5" />}
+            </Button>
+          </div>
+        </div>
       </section>
     </div>
   )
@@ -326,39 +346,42 @@ export function ChatPage() {
 function MessageBubble({ message }: { message: Message }) {
   const isUser = message.role === "user"
 
+  if (isUser) {
+    return (
+      <div className="flex animate-fade-up justify-end">
+        <div className="max-w-[80%] rounded-xl bg-primary px-4 py-2.5 text-sm whitespace-pre-wrap break-words text-primary-foreground">
+          {message.content}
+        </div>
+      </div>
+    )
+  }
+
   return (
-    <div className={`flex items-start gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
-      <Avatar className="w-8 h-8">
-        <AvatarFallback className={isUser ? "bg-primary text-primary-foreground" : "bg-primary/10"}>
-          {isUser ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4 text-primary" />}
+    <div className="flex animate-fade-up items-start gap-3">
+      <Avatar className="size-8 shrink-0">
+        <AvatarFallback className="bg-primary/10">
+          <Bot className="size-4 text-primary" />
         </AvatarFallback>
       </Avatar>
-
-      <div className={`max-w-[80%] space-y-2 ${isUser ? "items-end" : "items-start"} flex flex-col`}>
-        <div className={`px-4 py-2 rounded-lg ${
-          isUser
-            ? "bg-primary text-primary-foreground"
-            : "bg-muted text-foreground"
-        }`}>
-          <p className="text-sm whitespace-pre-wrap break-words">{message.content}</p>
-        </div>
+      <div className="min-w-0 flex-1 space-y-2">
+        <p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed">{message.content}</p>
 
         {message.sources && message.sources.length > 0 && (
-          <div className="w-full space-y-1">
-            <div className="flex items-center gap-1 text-xs text-muted-foreground">
-              <Search className="w-3 h-3" />
+          <div>
+            <div className="mb-1.5 flex items-center gap-1 text-xs text-muted-foreground">
+              <Search className="size-3" />
               <span>{message.sources.length} sources</span>
             </div>
-            {message.sources.map((source, i) => (
-              <SourceChip key={i} source={source} />
-            ))}
+            <div className="flex flex-wrap gap-1.5">
+              {message.sources.map((source, i) => (
+                <SourceChip key={i} source={source} />
+              ))}
+            </div>
           </div>
         )}
 
-        {!isUser && (
-          <p className="text-[11px] text-muted-foreground">
-            本次检索特性: {message.features ? message.features.join("·") : "默认"}
-          </p>
+        {messageMeta(message).length > 0 && (
+          <p className="font-mono text-[11px] text-muted-foreground">{messageMeta(message).join(" · ")}</p>
         )}
       </div>
     </div>
@@ -367,20 +390,22 @@ function MessageBubble({ message }: { message: Message }) {
 
 function SourceChip({ source }: { source: Source }) {
   return (
-    <div className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-muted/50 text-xs hover:bg-muted transition-colors cursor-pointer">
-      <FileText className="w-3 h-3 text-muted-foreground shrink-0" />
-      <span className="font-medium truncate">{source.doc_name}</span>
-      {source.chunk_index != null && (
-        <span className="text-muted-foreground shrink-0">#{source.chunk_index}</span>
-      )}
-      {source.page != null && (
-        <span className="text-muted-foreground shrink-0">p.{source.page}</span>
-      )}
-      {source.score != null && (
-        <span className="ml-auto text-muted-foreground shrink-0">
-          {source.score.toFixed(2)}
-        </span>
-      )}
+    <div className="group relative">
+      <div className="flex cursor-default items-center gap-1.5 rounded-md bg-muted/60 px-2.5 py-1 text-xs transition-colors group-hover:bg-accent">
+        <FileText className="size-3 shrink-0 text-muted-foreground" />
+        <span className="max-w-40 truncate font-medium">{source.doc_name}</span>
+        {source.page != null && <span className="font-mono text-[11px] text-muted-foreground">p.{source.page}</span>}
+        {source.chunk_index != null && (
+          <span className="font-mono text-[11px] text-muted-foreground">#{source.chunk_index}</span>
+        )}
+        {source.score != null && (
+          <span className="font-mono text-[11px] text-muted-foreground">{source.score.toFixed(2)}</span>
+        )}
+      </div>
+      <div className="pointer-events-none absolute bottom-full left-0 z-10 mb-1.5 hidden w-72 animate-fade-in rounded-lg border bg-popover p-3 text-xs shadow-md group-hover:block">
+        <p className="mb-1 font-medium">{source.doc_name}</p>
+        <p className="line-clamp-6 whitespace-pre-wrap text-muted-foreground">{source.text}</p>
+      </div>
     </div>
   )
 }

@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
-import { Check, Plus, Trash2 } from "lucide-react"
+import { Check, Eye, EyeOff, Plus, Trash2 } from "lucide-react"
 import {
   activateProvider,
   deleteProvider,
@@ -31,9 +31,10 @@ const BLANK: LLMProviderDraft = {
   active: false,
 }
 
-export function LLMSettings() {
+export function LLMSettings({ onChanged }: { onChanged?: () => void }) {
   const [rows, setRows] = useState<Row[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [showKeys, setShowKeys] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     let cancelled = false
@@ -55,7 +56,9 @@ export function LLMSettings() {
           }))
         )
       })
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : "Failed to load"))
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : "Failed to load providers")
+      })
     return () => {
       cancelled = true
     }
@@ -70,10 +73,7 @@ export function LLMSettings() {
   }
 
   async function save(row: Row) {
-    if (!row.name.trim() || !row.model.trim()) {
-      setMsg(row.key, "名称与模型不能为空", false)
-      return
-    }
+    if (!row.name.trim() || !row.model.trim()) return
     try {
       const saved = await upsertProvider({
         name: row.name.trim(),
@@ -84,74 +84,70 @@ export function LLMSettings() {
         active: row.active,
       })
       update(row.key, { id: saved.id, name: saved.name, active: saved.active })
-      setMsg(row.key, "已保存", true)
+      setMsg(row.key, "Saved", true)
+      onChanged?.()
     } catch (e) {
-      setMsg(row.key, e instanceof Error ? e.message : "保存失败", false)
+      setMsg(row.key, e instanceof Error ? e.message : "Save failed", false)
     }
   }
 
   async function activate(row: Row) {
     if (!row.id) {
-      setMsg(row.key, "请先保存", false)
+      setMsg(row.key, "Save the row first", false)
       return
     }
+    setMsg(row.key, "Activating…", true)
     try {
       await activateProvider(row.id)
-      // 激活是互斥的，重载整个列表
-      const providers = await fetchProviders()
-      setRows(
-        providers.map((p) => ({
-          name: p.name,
-          model: p.model,
-          base_url: p.base_url,
-          api_key: p.api_key,
-          timeout: p.timeout,
-          active: p.active,
-          id: p.id,
-          key: p.id,
-          msg: "",
-          msgOk: true,
+      setRows((prev) =>
+        prev.map((r) => ({
+          ...r,
+          active: r.id === row.id,
+          msg: r.id === row.id ? "Activated" : r.msg && r.msgOk === false ? r.msg : "",
+          msgOk: r.id === row.id ? true : r.msgOk,
         }))
       )
+      onChanged?.()
     } catch (e) {
-      setMsg(row.key, e instanceof Error ? e.message : "激活失败", false)
+      setMsg(row.key, e instanceof Error ? e.message : "Activate failed", false)
     }
   }
 
   async function test(row: Row) {
     if (!row.id) {
-      setMsg(row.key, "请先保存", false)
+      setMsg(row.key, "Save the row first", false)
       return
     }
-    setMsg(row.key, "测试中…", true)
+    setMsg(row.key, "Testing…", true)
     try {
       const result = await testProvider(row.id)
       setMsg(row.key, result.detail, result.ok)
     } catch (e) {
-      setMsg(row.key, e instanceof Error ? e.message : "测试失败", false)
+      setMsg(row.key, e instanceof Error ? e.message : "Test failed", false)
     }
   }
 
   async function remove(row: Row) {
-    if (!row.id) {
-      setRows((prev) => prev.filter((r) => r.key !== row.key))
-      return
+    if (row.id) {
+      try {
+        await deleteProvider(row.id)
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Delete failed")
+        return
+      }
     }
-    try {
-      await deleteProvider(row.id)
-      setRows((prev) => prev.filter((r) => r.key !== row.key))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "删除失败")
-    }
+    setRows((prev) => prev.filter((r) => r.key !== row.key))
+    onChanged?.()
   }
 
   return (
-    <div className="mx-auto max-w-[1200px] space-y-4">
-      <div className="flex items-center justify-between">
+    <div className="mx-auto max-w-[1200px]">
+      <div className="mb-6 flex items-center justify-between">
         <div>
-          <h2 className="text-xl font-semibold">LLM Providers</h2>
-          <p className="text-sm text-muted-foreground">
-            填入 Provider 配置并激活，Chat 将使用激活的 LLM；未激活时回退 .env 配置
+          <h2 className="text-2xl font-semibold tracking-tight">LLM Providers</h2>
+          <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+            Add a provider and activate it. Chat answers use the active LLM; without one, the
+            backend falls back to the .env configuration.
           </p>
         </div>
         <Button
@@ -159,7 +155,7 @@ export function LLMSettings() {
           onClick={() =>
             setRows((prev) => [
               ...prev,
-              { ...BLANK, id: null, key: `draft-${prev.length}-${Date.now()}`, msg: "", msgOk: true },
+              { ...BLANK, id: null, key: `draft-${Date.now()}`, msg: "", msgOk: true },
             ])
           }
         >
@@ -168,33 +164,35 @@ export function LLMSettings() {
       </div>
 
       {error && (
-        <Alert variant="destructive">
+        <Alert variant="destructive" className="mb-4">
           <AlertDescription>{error}</AlertDescription>
         </Alert>
       )}
 
       {rows.length === 0 ? (
-        <div className="py-12 text-center text-muted-foreground">
-          <p className="text-lg">No LLM providers yet</p>
-          <p className="mt-1 text-sm">点击右上角 “Add provider” 添加第一个 Provider</p>
+        <div className="py-20 text-center">
+          <p className="text-lg font-medium">No LLM providers yet</p>
+          <p className="mx-auto mt-1 max-w-sm text-sm text-muted-foreground">
+            Add a provider with a name, model, base URL, and API key.
+          </p>
         </div>
       ) : (
         <div className="overflow-x-auto rounded-lg border bg-card">
-          <table className="w-full min-w-[960px] text-sm">
+          <table className="w-full min-w-[980px] text-sm">
             <thead>
-              <tr className="border-b text-left text-muted-foreground">
-                <th className="px-3 py-2 font-medium">Name</th>
-                <th className="px-3 py-2 font-medium">Model</th>
-                <th className="px-3 py-2 font-medium">Base URL</th>
-                <th className="px-3 py-2 font-medium">API Key</th>
-                <th className="px-3 py-2 font-medium">Timeout</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
+              <tr className="border-b bg-muted/30 text-left text-xs font-medium text-muted-foreground">
+                <th className="px-3 py-2.5">Name</th>
+                <th className="px-3 py-2.5">Model</th>
+                <th className="px-3 py-2.5">Base URL</th>
+                <th className="px-3 py-2.5">API key</th>
+                <th className="px-3 py-2.5">Timeout</th>
+                <th className="px-3 py-2.5 text-right">Actions</th>
               </tr>
             </thead>
             <tbody>
               {rows.map((row) => (
                 <tr key={row.key} className="border-b last:border-0">
-                  <td className="px-3 py-2">
+                  <td className="px-3 py-2.5">
                     <div className="flex items-center gap-2">
                       <Input
                         value={row.name}
@@ -203,13 +201,13 @@ export function LLMSettings() {
                         onChange={(e) => update(row.key, { name: e.target.value })}
                       />
                       {row.active && (
-                        <Badge>
+                        <Badge variant="secondary" className="shrink-0 bg-primary/10 text-primary hover:bg-primary/10">
                           <Check className="size-3" /> Active
                         </Badge>
                       )}
                     </div>
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="px-3 py-2.5">
                     <Input
                       value={row.model}
                       placeholder="gpt-4o-mini"
@@ -217,7 +215,7 @@ export function LLMSettings() {
                       onChange={(e) => update(row.key, { model: e.target.value })}
                     />
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="px-3 py-2.5">
                     <Input
                       value={row.base_url}
                       placeholder="https://api.openai.com/v1"
@@ -225,27 +223,49 @@ export function LLMSettings() {
                       onChange={(e) => update(row.key, { base_url: e.target.value })}
                     />
                   </td>
-                  <td className="px-3 py-2">
-                    <Input
-                      type="password"
-                      value={row.api_key}
-                      placeholder="sk-..."
-                      className="h-8 w-44"
-                      onChange={(e) => update(row.key, { api_key: e.target.value })}
-                    />
+                  <td className="px-3 py-2.5">
+                    <div className="flex items-center gap-1.5">
+                      <Input
+                        type={showKeys[row.key] ? "text" : "password"}
+                        value={row.api_key}
+                        placeholder="sk-..."
+                        className="h-8 w-36 font-mono"
+                        onChange={(e) => update(row.key, { api_key: e.target.value })}
+                      />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7"
+                        title={showKeys[row.key] ? "Hide key" : "Show key"}
+                        aria-label={showKeys[row.key] ? "Hide API key" : "Show API key"}
+                        onClick={() =>
+                          setShowKeys((prev) => ({ ...prev, [row.key]: !prev[row.key] }))
+                        }
+                      >
+                        {showKeys[row.key] ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                      </Button>
+                    </div>
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="px-3 py-2.5">
                     <Input
                       type="number"
                       min={1}
                       max={600}
                       value={row.timeout}
-                      className="h-8 w-20"
+                      className="h-8 w-16 font-mono"
                       onChange={(e) => update(row.key, { timeout: Number(e.target.value) || 60 })}
                     />
                   </td>
-                  <td className="px-3 py-2">
+                  <td className="px-3 py-2.5">
                     <div className="flex items-center justify-end gap-1.5">
+                      {row.msg && (
+                        <span
+                          className={`w-28 truncate text-right font-mono text-xs ${row.msgOk ? "text-muted-foreground" : "text-destructive"}`}
+                          title={row.msg}
+                        >
+                          {row.msg}
+                        </span>
+                      )}
                       <Button size="xs" variant="outline" onClick={() => test(row)}>
                         Test
                       </Button>
@@ -264,17 +284,16 @@ export function LLMSettings() {
                       >
                         Save
                       </Button>
-                      <Button size="xs" variant="ghost" onClick={() => remove(row)}>
-                        <Trash2 />
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="size-7 text-muted-foreground hover:text-destructive"
+                        onClick={() => remove(row)}
+                        title="Delete"
+                        aria-label="Delete provider"
+                      >
+                        <Trash2 className="size-3.5" />
                       </Button>
-                      {row.msg && (
-                        <span
-                          className={`w-36 truncate text-xs ${row.msgOk ? "text-muted-foreground" : "text-destructive"}`}
-                          title={row.msg}
-                        >
-                          {row.msg}
-                        </span>
-                      )}
                     </div>
                   </td>
                 </tr>

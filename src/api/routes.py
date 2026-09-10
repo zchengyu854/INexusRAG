@@ -42,6 +42,7 @@ from src.storage.database import (
     save_message,
     list_llm_providers as list_llm_provider_rows,
     get_llm_provider as get_llm_provider_row,
+    get_active_llm_provider as get_active_llm_provider_row,
     upsert_llm_provider as upsert_llm_provider_row,
     activate_llm_provider as activate_llm_provider_row,
     delete_llm_provider as delete_llm_provider_row,
@@ -393,6 +394,12 @@ def _llm_provider_out(row: dict) -> LLMProviderOut:
 @router.get("/llm/providers", response_model=list[LLMProviderOut])
 def list_llm_providers():
     return [_llm_provider_out(row) for row in list_llm_provider_rows()]
+
+
+@router.get("/llm/active")
+def active_llm_provider():
+    row = get_active_llm_provider_row()
+    return {"provider": _llm_provider_out(row) if row else None}
 
 
 @router.post("/llm/providers", response_model=LLMProviderOut, status_code=200)

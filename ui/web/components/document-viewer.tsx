@@ -3,17 +3,22 @@
 import { useCallback, useEffect, useState } from "react"
 import { getChunks, previewRechunk, rechunkDocument, type Chunk, type Doc, type PreviewResult, type RechunkResult } from "@/lib/api"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { ArrowLeft, RefreshCw, Eye, Settings, Trash2 } from "lucide-react"
+import { ArrowLeft, RefreshCw, Eye, Trash2, Check, X } from "lucide-react"
 
 interface DocumentViewerProps {
   doc: Doc
   onBack: () => void
   onDeleted: () => void
   onRefresh: () => void
+}
+
+function chunkMeta(chunk: { index: number; length: number; page?: number | null }) {
+  const parts = [`#${chunk.index}`, `${chunk.length} chars`]
+  if (chunk.page != null) parts.push(`p.${chunk.page}`)
+  return parts.join(", ")
 }
 
 export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentViewerProps) {
@@ -55,8 +60,8 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
         chunk_size: data.config.chunk_size,
         chunk_overlap: data.config.chunk_overlap,
       })
-    }).catch((error) => {
-      if (!cancelled) setError(error instanceof Error ? error.message : "Failed to load chunks")
+    }).catch((err) => {
+      if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load chunks")
     }).finally(() => {
       if (!cancelled) setLoading(false)
     })
@@ -67,8 +72,7 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
     setPreviewLoading(true)
     setError(null)
     try {
-      const data = await previewRechunk(doc.id, config)
-      setPreview(data)
+      setPreview(await previewRechunk(doc.id, config))
       setRechunkResult(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : "Preview failed")
@@ -93,19 +97,18 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
   }
 
   return (
-    <div className="space-y-6">
-      {/* Header */}
+    <div className="mx-auto max-w-[1100px] space-y-6">
       <div className="flex items-center gap-4">
         <Button variant="ghost" size="sm" onClick={onBack}>
-          <ArrowLeft className="w-4 h-4 mr-1" />
+          <ArrowLeft className="mr-1 h-4 w-4" />
           Back
         </Button>
-        <div className="flex-1">
-          <h2 className="text-xl font-semibold">{doc.filename}</h2>
-          <p className="text-sm text-muted-foreground">{doc.id}</p>
+        <div className="min-w-0 flex-1">
+          <h2 className="truncate text-2xl font-semibold tracking-tight">{doc.filename}</h2>
+          <p className="truncate font-mono text-xs text-muted-foreground">{doc.id}</p>
         </div>
         <Button variant="outline" size="sm" onClick={loadChunks} disabled={loading}>
-          <RefreshCw className="w-4 h-4 mr-1" />
+          <RefreshCw className="mr-1 h-4 w-4" />
           Refresh
         </Button>
       </div>
@@ -116,103 +119,80 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
         </Alert>
       )}
 
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-4">
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-2xl font-bold">{totalChunks}</p>
-            <p className="text-sm text-muted-foreground">Indexed chunks</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-2xl font-bold">{config.chunk_size}</p>
-            <p className="text-sm text-muted-foreground">Oversize fallback limit</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="p-4">
-            <p className="text-2xl font-bold">{config.chunk_overlap}</p>
-            <p className="text-sm text-muted-foreground">Overlap</p>
-          </CardContent>
-        </Card>
+      <div className="grid grid-cols-3 gap-6 border-b pb-6">
+        {[
+          { value: totalChunks, label: "Indexed chunks" },
+          { value: config.chunk_size, label: "Chunk size" },
+          { value: config.chunk_overlap, label: "Overlap" },
+        ].map((stat) => (
+          <div key={stat.label}>
+            <p className="font-mono text-3xl font-semibold tracking-tight">{stat.value}</p>
+            <p className="mt-1 text-sm text-muted-foreground">{stat.label}</p>
+          </div>
+        ))}
       </div>
 
-      {/* Chunks List */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Indexed chunks ({totalChunks})</CardTitle>
-          <p className="text-sm text-muted-foreground">{Math.min(chunks.length, totalChunks)} of {totalChunks} chunks shown, stored in PostgreSQL</p>
-        </CardHeader>
-        <CardContent>
-          {loading ? (
-            <div className="text-center py-8 text-muted-foreground">Loading...</div>
-          ) : chunks.length === 0 ? (
-            <div className="text-center py-8 text-muted-foreground">No chunks found</div>
-          ) : (
-            <div className="space-y-2 max-h-96 overflow-y-auto">
-              {chunks.map((chunk) => (
-                <div key={chunk.index} className="p-3 bg-muted rounded-lg">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-sm font-mono text-muted-foreground">
-                      #{chunk.index} · {chunk.length} chars{chunk.page != null ? ` · p.${chunk.page}` : ""}
-                    </span>
-                  </div>
-                  <p className="text-sm whitespace-pre-wrap break-words">{chunk.text}</p>
-                </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <section className="rounded-lg border bg-card">
+        <div className="flex items-center justify-between border-b px-4 py-3">
+          <h3 className="font-medium">Indexed chunks ({totalChunks})</h3>
+          <span className="text-xs text-muted-foreground">
+            {Math.min(chunks.length, totalChunks)} of {totalChunks} shown
+          </span>
+        </div>
+        {loading ? (
+          <div className="py-10 text-center text-sm text-muted-foreground">Loading…</div>
+        ) : chunks.length === 0 ? (
+          <div className="py-10 text-center text-sm text-muted-foreground">No chunks found</div>
+        ) : (
+          <div className="max-h-96 space-y-2 overflow-y-auto p-3">
+            {chunks.map((chunk) => (
+              <div key={chunk.index} className="rounded-md bg-muted/50 p-3">
+                <p className="mb-1 font-mono text-xs text-muted-foreground">{chunkMeta(chunk)}</p>
+                <p className="whitespace-pre-wrap break-words text-sm">{chunk.text}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {preview && (
-        <Card className="border-primary/30">
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between gap-3">
-              <span>New rule preview ({preview.total_chunks})</span>
-              <span className="text-sm font-normal text-muted-foreground">not indexed</span>
-            </CardTitle>
-            <p className="text-sm text-muted-foreground">
-              Markdown headings, paragraphs, lists, and code blocks stay as semantic boundaries.
-            </p>
-          </CardHeader>
-          <CardContent>
-            <div className="mb-3 rounded-md bg-primary/5 px-3 py-2 text-sm text-muted-foreground">
-              Current indexed chunks: {totalChunks} · Embeddings on rechunk: {preview.total_chunks}
+        <section className="rounded-lg border border-primary/30 bg-card">
+          <div className="flex items-center justify-between border-b px-4 py-3">
+            <h3 className="font-medium">New chunking preview ({preview.total_chunks})</h3>
+            <span className="text-xs text-muted-foreground">not indexed</span>
+          </div>
+          <div className="space-y-2 p-3">
+            <div className="rounded-md bg-primary/5 px-3 py-2 text-sm text-muted-foreground">
+              Current: {totalChunks} chunks. Rechunk will embed {preview.total_chunks} chunks.
             </div>
-            <div className="space-y-2 max-h-96 overflow-y-auto">
-              {preview.chunks.slice(0, 20).map((chunk) => (
-                <div key={chunk.index} className="rounded-lg bg-muted p-3">
-                  <div className="mb-1 text-sm font-mono text-muted-foreground">
-                    #{chunk.index} · {chunk.length} chars{chunk.page != null ? ` · p.${chunk.page}` : ""}
-                  </div>
-                  <p className="text-sm whitespace-pre-wrap break-words">{chunk.text}</p>
-                </div>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
+            {preview.chunks.slice(0, 20).map((chunk) => (
+              <div key={chunk.index} className="rounded-md bg-muted/50 p-3">
+                <p className="mb-1 font-mono text-xs text-muted-foreground">{chunkMeta(chunk)}</p>
+                <p className="whitespace-pre-wrap break-words text-sm">{chunk.text}</p>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
-      {/* Rechunk Section */}
       <Separator />
-      <div className="flex items-center justify-between">
-        <h3 className="text-lg font-semibold flex items-center gap-2">
-          <Settings className="w-5 h-5" />
-          Rechunk
-        </h3>
-        <Button variant="ghost" size="sm" onClick={() => setShowRechunk(!showRechunk)}>
-          {showRechunk ? "Hide" : "Show"}
-        </Button>
-      </div>
 
-      {showRechunk && (
-        <Card>
-          <CardContent className="p-6 space-y-4">
+      <div>
+        <button
+          onClick={() => setShowRechunk(!showRechunk)}
+          className="flex w-full items-center justify-between rounded-lg border bg-card px-4 py-3 text-left text-sm font-medium transition-colors hover:bg-muted/50"
+        >
+          <span>Rechunk settings</span>
+          <span className="font-mono text-xs text-muted-foreground">
+            {config.chunk_size} / {config.chunk_overlap}
+          </span>
+        </button>
+
+        {showRechunk && (
+          <div className="animate-fade-up space-y-4 border-t bg-card p-4">
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Chunk Size</label>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">Chunk size (64-4096)</label>
                 <Input
                   type="number"
                   value={config.chunk_size}
@@ -225,8 +205,8 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
                   step={64}
                 />
               </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Overlap</label>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-muted-foreground">Overlap (0-4095)</label>
                 <Input
                   type="number"
                   value={config.chunk_overlap}
@@ -239,46 +219,54 @@ export function DocumentViewer({ doc, onBack, onDeleted, onRefresh }: DocumentVi
                   step={32}
                 />
               </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Rule</label>
-                <div className="flex h-9 items-center rounded-md border border-input bg-muted/40 px-3 text-sm text-muted-foreground">
-                  Markdown semantic boundaries
-                </div>
-              </div>
             </div>
 
             <div className="flex gap-2">
               <Button variant="outline" onClick={handlePreview} disabled={loading || previewLoading}>
-                {previewLoading ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Eye className="w-4 h-4 mr-1" />}
-                {previewLoading ? "Previewing..." : "Preview"}
+                {previewLoading ? <RefreshCw className="mr-1 h-4 w-4 animate-spin" /> : <Eye className="mr-1 h-4 w-4" />}
+                {previewLoading ? "Previewing…" : "Preview"}
               </Button>
               <Button onClick={handleRechunk} disabled={loading || !preview}>
-                <RefreshCw className="w-4 h-4 mr-1" />
+                <RefreshCw className="mr-1 h-4 w-4" />
                 Rechunk
               </Button>
             </div>
 
             {rechunkResult && (
-              <Alert>
-                <AlertDescription>
-                  {rechunkResult.success
-                    ? `✅ ${rechunkResult.old_chunks} → ${rechunkResult.new_chunks} chunks (${rechunkResult.latency_ms.toFixed(0)}ms)`
-                    : `❌ ${rechunkResult.error ?? ""}`}
+              <Alert variant={rechunkResult.success ? "default" : "destructive"}>
+                <AlertDescription className="flex items-center gap-2">
+                  {rechunkResult.success ? (
+                    <>
+                      <Check className="size-4 text-primary" />
+                      <span>
+                        {rechunkResult.old_chunks} to {rechunkResult.new_chunks} chunks (
+                        {rechunkResult.latency_ms.toFixed(0)}ms)
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <X className="size-4 text-destructive" />
+                      <span>{rechunkResult.error ?? "Rechunk failed"}</span>
+                    </>
+                  )}
                 </AlertDescription>
               </Alert>
             )}
-          </CardContent>
-        </Card>
-      )}
+          </div>
+        )}
+      </div>
 
-      {/* Delete */}
       <div className="flex justify-end">
-        <Button variant="destructive" size="sm" onClick={() => {
-          if (confirm(`Delete ${doc.filename}?`)) {
-            onDeleted()
-          }
-        }}>
-          <Trash2 className="w-4 h-4 mr-1" />
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={() => {
+            if (confirm(`Delete ${doc.filename}?`)) {
+              onDeleted()
+            }
+          }}
+        >
+          <Trash2 className="mr-1 h-4 w-4" />
           Delete
         </Button>
       </div>
