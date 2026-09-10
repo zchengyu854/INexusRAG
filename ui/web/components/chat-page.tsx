@@ -1,7 +1,7 @@
 "use client"
 
 import { useState, useRef, useEffect } from "react"
-import { clearConversation, getConversationMessages, getConversations, queryDoc, type ConversationSummary, type Source } from "@/lib/api"
+import { clearConversation, getConversationMessages, getConversations, queryDoc, type ConversationSummary, type Figure, type Source } from "@/lib/api"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
@@ -13,6 +13,7 @@ interface Message {
   role: "user" | "assistant"
   content: string
   sources?: Source[]
+  figures?: Figure[]
   features?: string[]
   latency_ms?: number
   timestamp: Date
@@ -189,6 +190,7 @@ export function ChatPage({ onGoToDocuments }: { onGoToDocuments: () => void }) {
         role: "assistant",
         content: result.answer,
         sources: result.sources || [],
+        figures: result.figures || [],
         features: featuresSent,
         latency_ms: result.latency_ms,
         timestamp: new Date(),
@@ -383,6 +385,23 @@ function MessageBubble({ message }: { message: Message }) {
       </Avatar>
       <div className="min-w-0 flex-1 space-y-2">
         <p className="whitespace-pre-wrap break-words text-[15px] leading-relaxed">{message.content}</p>
+
+        {message.figures && message.figures.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {message.figures.map((fig, i) => (
+              <figure key={i} className="max-w-[240px] rounded-md border bg-background p-1">
+                <img
+                  src={fig.data_uri}
+                  alt={`Image from page ${fig.page}`}
+                  width={Math.min(fig.width, 240)}
+                  height={Math.round((fig.height / fig.width) * Math.min(fig.width, 240))}
+                  className="rounded-sm"
+                />
+                <figcaption className="mt-0.5 font-mono text-[11px] text-muted-foreground">page {fig.page}</figcaption>
+              </figure>
+            ))}
+          </div>
+        )}
 
         {message.sources && message.sources.length > 0 && (
           <div>
