@@ -20,14 +20,16 @@ interface Message {
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
 
-const FEATURE_OPTIONS: { key: string; label: string }[] = [
-  { key: "routing", label: "路由" },
-  { key: "keywords", label: "关键词" },
-  { key: "decompose", label: "分解" },
-  { key: "stepback", label: "退步" },
-  { key: "hyde", label: "假想文档" },
-  { key: "rerank", label: "重排" },
+const FEATURE_OPTIONS: { key: string; label: string; desc: string }[] = [
+  { key: "routing", label: "路由", desc: "先选目标文档再检索，缩小搜索范围" },
+  { key: "keywords", label: "关键词", desc: "精确词匹配（专有名词、代号、数字）" },
+  { key: "decompose", label: "分解", desc: "复杂问题拆成子问题分别检索" },
+  { key: "stepback", label: "退步", desc: "细节问题先退成概念问题再检索" },
+  { key: "hyde", label: "假想文档", desc: "生成假想答案段落辅助语义检索" },
+  { key: "rerank", label: "重排", desc: "检索末端对候选精细排序（稍慢）" },
 ]
+
+const LAST_FEATURES_KEY = "nexus-rag-last-features"
 
 const DEFAULT_FEATURES = ["routing", "keywords", "decompose", "stepback", "hyde"]
 
@@ -149,6 +151,8 @@ export function ChatPage() {
 
     try {
       const featuresSent = computeFeatures()
+      // ponytail: 历史记录无 per-message features，用最后一次发送的值近似展示
+      window.localStorage.setItem(LAST_FEATURES_KEY, JSON.stringify(featuresSent))
       const result = await queryDoc(question, conversationId, 5, undefined, featuresSent)
       clearInterval(progressInterval)
       setProgress(100)
@@ -288,16 +292,20 @@ export function ChatPage() {
           </Button>
         </div>
         {showFeatures && (
-          <div className="mx-auto mb-2 flex max-w-3xl flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/30 p-2">
-            <span className="text-xs font-medium">检索特性</span>
+          <div className="mx-auto mb-2 w-full max-w-3xl space-y-0.5 rounded-md border bg-muted/30 p-2">
+            <div className="flex items-center gap-2 px-1 pb-1">
+              <span className="text-xs font-medium">检索特性</span>
+              <span className="text-[11px] text-muted-foreground">勾选后按当前组合检索，全部不选或默认组合则使用后端默认</span>
+            </div>
             {FEATURE_OPTIONS.map((o) => (
-              <label key={o.key} title={o.key} className="flex cursor-pointer items-center gap-1.5 text-xs">
+              <label key={o.key} className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-muted" title={o.key}>
                 <input
                   type="checkbox"
                   checked={checked[o.key]}
                   onChange={(e) => setChecked((prev) => ({ ...prev, [o.key]: e.target.checked }))}
                 />
-                <span>{o.label}</span>
+                <span className="text-xs font-medium">{o.label}</span>
+                <span className="text-[11px] text-muted-foreground">{o.desc}</span>
               </label>
             ))}
           </div>
@@ -323,8 +331,20 @@ export function ChatPage() {
   )
 }
 
+function getLastFeatures(): string[] | null {
+  try {
+    const raw = window.localStorage.getItem(LAST_FEATURES_KEY)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as string[]) : null
+  } catch {
+    return null
+  }
+}
+
 function MessageBubble({ message }: { message: Message }) {
   const isUser = message.role === "user"
+  const shownFeatures = message.features ?? getLastFeatures()
 
   return (
     <div className={`flex items-start gap-3 ${isUser ? "flex-row-reverse" : ""}`}>
@@ -357,7 +377,7 @@ function MessageBubble({ message }: { message: Message }) {
 
         {!isUser && (
           <p className="text-[11px] text-muted-foreground">
-            本次检索特性: {message.features ? message.features.join("·") : "默认"}
+            本次检索特性: {shownFeatures ? shownFeatures.join("·") : "默认"}
           </p>
         )}
       </div>
