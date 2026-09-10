@@ -1,9 +1,9 @@
 import type { Metadata } from "next"
-import { Geist, Geist_Mono } from "next/font/google"
+import { Outfit, Geist_Mono } from "next/font/google"
 import "./globals.css"
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const outfit = Outfit({
+  variable: "--font-outfit",
   subsets: ["latin"],
 })
 
@@ -15,17 +15,13 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "NexusRAG",
   description: "Multi-document intelligent Q&A system",
+  themeColor: "#0d0f16",
 }
-
-const themeScript = `(function(){try{var t=localStorage.getItem('nexus-theme');if(t==='dark'||(!t&&window.matchMedia('(prefers-color-scheme: dark)').matches)){document.documentElement.classList.add('dark')}}catch(e){}})();`
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <head>
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
-      </head>
-      <body className={`${geistSans.variable} ${geistMono.variable} min-h-screen bg-background text-foreground`}>
+    <html lang="en" className="dark">
+      <body className={`${outfit.variable} ${geistMono.variable} min-h-dvh overflow-x-hidden bg-background text-foreground`}>
         {children}
       </body>
     </html>

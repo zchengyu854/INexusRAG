@@ -25,57 +25,40 @@
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
-  --font-sans: var(--font-geist-sans);
+  --font-sans: var(--font-outfit);
   --font-mono: var(--font-geist-mono);
-  --animate-fade-up: fade-up 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
-  --animate-fade-in: fade-in 0.3s ease-out both;
+  --animate-fade-up: fade-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-fade-in: fade-in 0.4s ease-out both;
   --animate-pulse-soft: pulse-soft 1.6s ease-in-out infinite;
+  --animate-marquee: marquee 28s linear infinite;
 }
 
-/* Off-white / off-black, no pure #fff or #000. Cool neutral base + single emerald accent. */
-:root {
-  --radius: 0.625rem;
-  --background: oklch(0.985 0.002 250);
-  --foreground: oklch(0.23 0.006 260);
-  --card: oklch(0.995 0.001 250);
-  --card-foreground: oklch(0.23 0.006 260);
-  --popover: oklch(0.995 0.001 250);
-  --popover-foreground: oklch(0.23 0.006 260);
-  --primary: oklch(0.6 0.13 165);
-  --primary-foreground: oklch(0.98 0 0);
-  --secondary: oklch(0.95 0.004 250);
-  --secondary-foreground: oklch(0.26 0.006 260);
-  --muted: oklch(0.95 0.004 250);
-  --muted-foreground: oklch(0.5 0.012 250);
-  --accent: oklch(0.93 0.03 165);
-  --accent-foreground: oklch(0.27 0.05 165);
-  --destructive: oklch(0.55 0.2 27);
-  --destructive-foreground: oklch(0.98 0 0);
-  --border: oklch(0.9 0.005 250);
-  --input: oklch(0.9 0.005 250);
-  --ring: oklch(0.6 0.13 165);
-}
-
+/*
+  Locked dark theme (no light mode).
+  Near-black cool base + single ember accent. No pure #000 / #fff.
+*/
+:root,
 .dark {
-  --background: oklch(0.155 0.006 260);
-  --foreground: oklch(0.93 0.002 250);
-  --card: oklch(0.2 0.006 260);
-  --card-foreground: oklch(0.93 0.002 250);
-  --popover: oklch(0.2 0.006 260);
-  --popover-foreground: oklch(0.93 0.002 250);
-  --primary: oklch(0.7 0.15 165);
-  --primary-foreground: oklch(0.155 0.006 260);
-  --secondary: oklch(0.25 0.006 260);
-  --secondary-foreground: oklch(0.93 0.002 250);
-  --muted: oklch(0.24 0.006 260);
-  --muted-foreground: oklch(0.65 0.012 250);
-  --accent: oklch(0.28 0.04 165);
-  --accent-foreground: oklch(0.9 0.03 165);
-  --destructive: oklch(0.64 0.19 27);
+  --radius: 0.75rem;
+  --background: oklch(0.15 0.014 265);
+  --foreground: oklch(0.93 0.004 260);
+  --card: oklch(0.2 0.014 265);
+  --card-foreground: oklch(0.93 0.004 260);
+  --popover: oklch(0.22 0.016 265);
+  --popover-foreground: oklch(0.93 0.004 260);
+  --primary: oklch(0.68 0.19 45);
+  --primary-foreground: oklch(0.15 0.02 45);
+  --secondary: oklch(0.24 0.014 265);
+  --secondary-foreground: oklch(0.93 0.004 260);
+  --muted: oklch(0.23 0.014 265);
+  --muted-foreground: oklch(0.63 0.018 260);
+  --accent: oklch(0.27 0.05 45);
+  --accent-foreground: oklch(0.78 0.15 50);
+  --destructive: oklch(0.62 0.2 25);
   --destructive-foreground: oklch(0.97 0 0);
-  --border: oklch(0.3 0.006 260);
-  --input: oklch(0.31 0.006 260);
-  --ring: oklch(0.7 0.15 165);
+  --border: oklch(1 0 0 / 0.12);
+  --input: oklch(1 0 0 / 0.16);
+  --ring: oklch(0.68 0.19 45);
 }
 
 * {
@@ -87,12 +70,25 @@ body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Ambient layers: deep radial washes + fixed grain. Grain lives on a
+   pointer-events-none fixed layer only (no repaint cost on scroll). */
+.ambient {
+  background:
+    radial-gradient(56rem 38rem at 14% -8%, oklch(0.68 0.19 45 / 0.16), transparent 62%),
+    radial-gradient(72rem 52rem at 102% 108%, oklch(0.55 0.2 265 / 0.2), transparent 60%);
+}
+
+.grain {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix type='saturate' values='0'/></filter><rect width='160' height='160' filter='url(%23n)' opacity='0.5'/></svg>");
 }
 
 @keyframes fade-up {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
@@ -115,7 +111,13 @@ body {
     opacity: 1;
   }
   50% {
-    opacity: 0.4;
+    opacity: 0.35;
+  }
+}
+
+@keyframes marquee {
+  to {
+    transform: translateX(-50%);
   }
 }
 
