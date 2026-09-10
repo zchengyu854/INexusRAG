@@ -146,8 +146,8 @@ def plan_question(question: str) -> dict:
         return empty
 
 
-ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rerank")
-_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")  # rerank 默认关，消融时显式传 features
+ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rerank", "graph")
+_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")  # rerank/graph 默认关，消融时显式传 features
 
 
 def multi_query_search(question: str, top_k: int, filters: dict | None = None, features: list[str] | None = None) -> list[dict]:
@@ -173,6 +173,10 @@ def multi_query_search(question: str, top_k: int, filters: dict | None = None, f
     if "hyde" in active and plan["hyde"]:
         hyde_vec = get_embedder().encode([plan["hyde"]])[0]
         channels.append(two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing))
+    if "graph" in active:
+        # 图谱通道：复用原问题的向量做实体锚点，零额外 embedding 成本
+        from src.graph import graph_channel
+        channels.append(graph_channel(vectors[0], top_k=max(top_k * 5, 25), filters=filters))
     merged = rrf_merge(channels, top_k if "rerank" not in active else top_k * 5)
     if "rerank" in active and merged:
         from src.rerank import rerank

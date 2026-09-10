@@ -67,13 +67,18 @@ class Embedder:
         )
 
     def _init_local(self):
+        # 必须早于 sentence_transformers 的 import：huggingface_hub 在导入时就把 HF_HUB_OFFLINE
+        # 读成模块常量，之后再设无效——会去连 huggingface.co 做 HEAD 缓存校验，弱网下每次都要
+        # 重试 5 次×10s（实测整个构建 400s 全耗在重试上、一块都没建）。
+        # 模型已在本地缓存时完全可离线；想联网下载就显式设 HF_HUB_OFFLINE=0。
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError:
             raise ImportError("使用本地 embedding 需要安装 sentence-transformers: uv add sentence-transformers")
 
         model_name = _get_env("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3")
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
         return SentenceTransformer(model_name, local_files_only=True)
 
     def encode(self, texts: Iterable[str]) -> list[list[float]]:

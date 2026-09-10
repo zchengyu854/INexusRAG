@@ -105,6 +105,37 @@ def ensure_database() -> None:
                 active BOOLEAN NOT NULL DEFAULT false,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS entities (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                norm TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL DEFAULT 'other',
+                description TEXT NOT NULL DEFAULT '',
+                embedding vector({_VECTOR_DIM}) NOT NULL,
+                mentions INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS entities_embedding_idx
+                ON entities USING hnsw (embedding vector_cosine_ops);
+            CREATE TABLE IF NOT EXISTS relations (
+                id UUID PRIMARY KEY,
+                src UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                dst UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                rel TEXT NOT NULL,
+                norm_rel TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1,
+                evidence UUID REFERENCES chunks(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE (src, dst, norm_rel)
+            );
+            CREATE INDEX IF NOT EXISTS relations_src_idx ON relations(src);
+            CREATE INDEX IF NOT EXISTS relations_dst_idx ON relations(dst);
+            CREATE TABLE IF NOT EXISTS chunk_entities (
+                chunk_id UUID NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+                entity_id UUID NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+                PRIMARY KEY (chunk_id, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS chunk_entities_entity_idx ON chunk_entities(entity_id);
             """
         )
         vector_type = conn.execute(
@@ -296,6 +327,176 @@ def search_doc_index(query_embedding: list[float], top_k: int = 3) -> list[dict]
             """,
             (query_vector, query_vector, top_k),
         ))
+
+
+# ===== GraphRAG P1：实体/关系存储（图谱是检索的第 4 条通道）=====
+# ponytail: P1 只做局部检索（实体锚点 + ≤2 跳）。社区摘要/全局检索在 P2。
+
+
+def upsert_entity(name: str, norm: str, kind: str, description: str, embedding: list[float]) -> str:
+    """按 norm 幂等写实体；已存在则累加 mentions、补空 kind/description，返回 entity id。"""
+    with connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO entities (id, name, norm, kind, description, embedding, mentions)
+            VALUES (%s, %s, %s, %s, %s, %s::vector, 1)
+            ON CONFLICT (norm) DO UPDATE
+                SET mentions = entities.mentions + 1,
+                    kind = CASE WHEN entities.kind = 'other' THEN EXCLUDED.kind ELSE entities.kind END,
+                    description = CASE
+                        WHEN entities.description = '' THEN EXCLUDED.description
+                        ELSE entities.description END
+            RETURNING id::text
+            """,
+            (str(uuid.uuid4()), name, norm, kind, description, vector_literal(embedding)),
+        ).fetchone()
+    return row["id"]
+
+
+def get_entity_by_norm(norm: str) -> dict | None:
+    """归一化名精确匹配（实体消歧第一层，零成本）。"""
+    with connection() as conn:
+        return conn.execute(
+            "SELECT id::text AS entity_id, name, norm, kind, description, mentions FROM entities WHERE norm = %s",
+            (norm,),
+        ).fetchone()
+
+
+def search_entities(query_embedding: list[float], top_k: int = 5) -> list[dict]:
+    """实体语义 ANN（查询侧锚点定位）：返回 [{entity_id, name, norm, kind, description, score}]。"""
+    query_vector = vector_literal(query_embedding)
+    with connection() as conn:
+        return list(conn.execute(
+            """
+            SELECT id::text AS entity_id, name, norm, kind, description,
+                   1 - (embedding <=> %s::vector) AS score
+            FROM entities
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (query_vector, query_vector, top_k),
+        ))
+
+
+def add_relation(src_id: str, dst_id: str, rel: str, norm_rel: str, evidence_chunk_id: str | None = None) -> None:
+    """幂等加边：同 (src,dst,norm_rel) 重复出现则 weight+1（共现证据计数）。自环忽略。"""
+    if src_id == dst_id:
+        return
+    with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO relations (id, src, dst, rel, norm_rel, weight, evidence)
+            VALUES (%s, %s, %s, %s, %s, 1, %s)
+            ON CONFLICT (src, dst, norm_rel) DO UPDATE SET weight = relations.weight + 1
+            """,
+            (str(uuid.uuid4()), src_id, dst_id, rel, norm_rel, evidence_chunk_id),
+        )
+
+
+def link_chunk_entities(chunk_id: str, entity_ids: list[str]) -> None:
+    """切片↔实体倒排（图召回最终由此落回切片）。"""
+    unique_ids = list(dict.fromkeys(entity_ids))
+    if not unique_ids:
+        return
+    values: list[object] = []
+    for entity_id in unique_ids:
+        values.extend([chunk_id, entity_id])
+    rows = "(" + "),(".join(["%s, %s"] * len(unique_ids)) + ")"
+    with connection() as conn:
+        conn.execute(
+            f"INSERT INTO chunk_entities (chunk_id, entity_id) VALUES {rows} ON CONFLICT DO NOTHING",
+            values,
+        )
+
+
+def get_chunks_for_graph(doc_id: str) -> list[dict]:
+    """图谱抽取用：带 chunk id 的切片列表（get_chunks 不带 id，抽不了图谱）。"""
+    with connection() as conn:
+        return list(conn.execute(
+            "SELECT id::text AS chunk_id, chunk_index, text FROM chunks WHERE document_id = %s ORDER BY chunk_index",
+            (doc_id,),
+        ))
+
+
+def chunk_has_entities(chunk_id: str) -> bool:
+    """该切片是否已建过图（断点续跑用；抽取无实体的切片会重复处理，属少数）。"""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM chunk_entities WHERE chunk_id = %s LIMIT 1", (chunk_id,)
+        ).fetchone()
+    return row is not None
+
+
+def graph_chunks(
+    anchor_ids: list[str],
+    hops: int = 2,
+    limit: int = 25,
+    filters: dict | None = None,
+) -> list[dict]:
+    """图通道：锚点实体 ≤hops 跳扩展 → 落回切片；返回与 search_chunks 同构的行。
+
+    score = Σ 1/(1+hop)（多锚点命中累加）。
+    剪枝策略：锚点自身发出的边（hop=0）不剪——锚点已确认相关；再往外走要求 weight>1，
+    因为单篇文档里多数关系只出现一次，一律要求 weight>1 会把图剪成空壳。
+    """
+    if not anchor_ids:
+        return []
+    where = ""
+    params: list[object] = [anchor_ids, hops]
+    if filters:
+        where = "WHERE c.metadata @> %s::jsonb"
+        params.append(json.dumps(filters, ensure_ascii=False))
+    params.append(limit)
+    with connection() as conn:
+        return list(conn.execute(
+            f"""
+            WITH RECURSIVE reach(entity_id, hop, path) AS (
+                SELECT a, 0, ARRAY[a] FROM unnest(%s::uuid[]) AS a
+                UNION ALL
+                SELECT nb.entity_id, reach.hop + 1, reach.path || nb.entity_id
+                FROM reach
+                JOIN LATERAL (
+                    SELECT CASE WHEN r.src = reach.entity_id THEN r.dst ELSE r.src END AS entity_id
+                    FROM relations r
+                    WHERE (r.src = reach.entity_id OR r.dst = reach.entity_id)
+                      AND (reach.hop = 0 OR r.weight > 1)
+                ) AS nb ON NOT (nb.entity_id = ANY(reach.path))
+                WHERE reach.hop < %s
+            )
+            SELECT c.id::text AS chunk_id, c.document_id, c.doc_name, c.chunk_index, c.text, c.metadata,
+                   SUM(1.0 / (1 + reach.hop))::double precision AS score
+            FROM reach
+            JOIN chunk_entities ce ON ce.entity_id = reach.entity_id
+            JOIN chunks c ON c.id = ce.chunk_id
+            {where}
+            GROUP BY c.id
+            ORDER BY score DESC
+            LIMIT %s
+            """,
+            params,
+        ))
+
+
+def reset_graph() -> None:
+    """P1 重建策略：全量清空（增量更新留到 P3，rechunk 后需重跑 build）。"""
+    with connection() as conn:
+        conn.execute("DELETE FROM relations")
+        conn.execute("DELETE FROM chunk_entities")
+        conn.execute("DELETE FROM entities")
+
+
+def graph_stats() -> dict:
+    with connection() as conn:
+        row = conn.execute(
+            """
+            SELECT (SELECT count(*) FROM entities) AS entities,
+                   (SELECT count(*) FROM relations) AS relations,
+                   (SELECT count(*) FROM chunk_entities) AS links,
+                   (SELECT count(*) FROM entities e WHERE NOT EXISTS (
+                        SELECT 1 FROM chunk_entities ce WHERE ce.entity_id = e.id)) AS orphan_entities
+            """
+        ).fetchone()
+    return dict(row)
 
 
 def save_message(
