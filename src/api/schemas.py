@@ -106,6 +106,20 @@ class SystemStats(BaseModel):
     total_size_kb: float
 
 
+class LLMProviderIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    model: str = Field(..., min_length=1)
+    base_url: str = "https://api.openai.com/v1"
+    api_key: str = ""
+    timeout: float = Field(60, ge=1, le=600)
+    active: bool = False
+
+
+class LLMProviderOut(LLMProviderIn):
+    id: str
+    created_at: str
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "0.1.0"

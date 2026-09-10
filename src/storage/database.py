@@ -95,6 +95,16 @@ def ensure_database() -> None:
                 embedding vector({_VECTOR_DIM}) NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
+            CREATE TABLE IF NOT EXISTS llm_providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                model TEXT NOT NULL,
+                base_url TEXT NOT NULL DEFAULT 'https://api.openai.com/v1',
+                api_key TEXT NOT NULL DEFAULT '',
+                timeout REAL NOT NULL DEFAULT 60,
+                active BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             """
         )
         vector_type = conn.execute(
@@ -350,6 +360,69 @@ def delete_messages(conversation_id: str) -> None:
             "DELETE FROM conversation_messages WHERE conversation_id = %s",
             (conversation_id,),
         )
+def list_llm_providers() -> list[dict]:
+    with connection() as conn:
+        return list(conn.execute("SELECT * FROM llm_providers ORDER BY created_at"))
+
+
+def get_llm_provider(provider_id: str) -> dict | None:
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM llm_providers WHERE id = %s", (provider_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_active_llm_provider() -> dict | None:
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM llm_providers WHERE active ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def upsert_llm_provider(data: dict) -> dict:
+    """按 name 插入或更新。"""
+    with connection() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO llm_providers (id, name, model, base_url, api_key, timeout, active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (name) DO UPDATE
+              SET model = EXCLUDED.model,
+                  base_url = EXCLUDED.base_url,
+                  api_key = EXCLUDED.api_key,
+                  timeout = EXCLUDED.timeout,
+                  active = EXCLUDED.active
+            RETURNING *
+            """,
+            (
+                str(uuid.uuid4()),
+                data["name"],
+                data["model"],
+                data["base_url"],
+                data["api_key"],
+                data["timeout"],
+                data.get("active", False),
+            ),
+        ).fetchone()
+    return dict(row)
+
+
+def activate_llm_provider(provider_id: str) -> dict | None:
+    """互斥激活：先全部置 false，再激活目标行（同一事务内提交）。"""
+    with connection() as conn:
+        conn.execute("UPDATE llm_providers SET active = false")
+        row = conn.execute(
+            "UPDATE llm_providers SET active = true WHERE id = %s RETURNING *", (provider_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_llm_provider(provider_id: str) -> bool:
+    with connection() as conn:
+        result = conn.execute("DELETE FROM llm_providers WHERE id = %s", (provider_id,))
+        return result.rowcount > 0
+
+
 def stats() -> dict:
     with connection() as conn:
         row = conn.execute(

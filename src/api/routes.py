@@ -20,10 +20,12 @@ from src.api.schemas import (
     RechunkResult,
     Source,
     SystemStats,
+    LLMProviderIn,
+    LLMProviderOut,
 )
 from src.ingestion.embedder import get_embedder
 from src.ingestion.splitter import split_document
-from src.llm.client import get_llm
+from src.llm.client import LLMClient, get_llm
 from src.retrieval import index_document_route, multi_query_search
 from src.storage.database import (
     create_document,
@@ -38,6 +40,11 @@ from src.storage.database import (
     delete_messages,
     get_messages,
     save_message,
+    list_llm_providers as list_llm_provider_rows,
+    get_llm_provider as get_llm_provider_row,
+    upsert_llm_provider as upsert_llm_provider_row,
+    activate_llm_provider as activate_llm_provider_row,
+    delete_llm_provider as delete_llm_provider_row,
 )
 
 router = APIRouter(prefix="/api")
@@ -365,3 +372,68 @@ async def delete_document(doc_id: str):
     if source_path.exists():
         source_path.unlink()
     return {"ok": True}
+
+
+# ---- LLM providers：在 UI 中管理并选择 LLM，active 的 provider 驱动 get_llm() ----
+
+
+def _llm_provider_out(row: dict) -> LLMProviderOut:
+    return LLMProviderOut(
+        id=row["id"],
+        name=row["name"],
+        model=row["model"],
+        base_url=row["base_url"],
+        api_key=row["api_key"],
+        timeout=float(row["timeout"]),
+        active=bool(row["active"]),
+        created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+    )
+
+
+@router.get("/llm/providers", response_model=list[LLMProviderOut])
+def list_llm_providers():
+    return [_llm_provider_out(row) for row in list_llm_provider_rows()]
+
+
+@router.post("/llm/providers", response_model=LLMProviderOut, status_code=200)
+def upsert_llm_provider(payload: LLMProviderIn):
+    """按 name 插入或更新 provider。"""
+    row = upsert_llm_provider_row(payload.model_dump())
+    return _llm_provider_out(row)
+
+
+@router.delete("/llm/providers/{provider_id}")
+def delete_llm_provider(provider_id: str):
+    if not delete_llm_provider_row(provider_id):
+        raise HTTPException(404, "LLM provider 不存在")
+    return {"ok": True}
+
+
+@router.post("/llm/providers/{provider_id}/activate", response_model=LLMProviderOut)
+def activate_llm_provider(provider_id: str):
+    """将目标 provider 设为 active（互斥）。"""
+    row = activate_llm_provider_row(provider_id)
+    if row is None:
+        raise HTTPException(404, "LLM provider 不存在")
+    return _llm_provider_out(row)
+
+
+@router.post("/llm/providers/{provider_id}/test")
+def test_llm_provider(provider_id: str):
+    """用该 provider 的配置发起一次最小补全，验证 key/base_url 可用。"""
+    row = get_llm_provider_row(provider_id)
+    if row is None:
+        raise HTTPException(404, "LLM provider 不存在")
+    client = LLMClient(
+        api_key=row["api_key"],
+        base_url=row["base_url"],
+        model=row["model"],
+        timeout=float(row["timeout"]),
+    )
+    try:
+        if not client.enabled:
+            return {"ok": False, "detail": "未设置 API Key"}
+        client.generate("Reply with a single word: ok", sources=[])
+        return {"ok": True, "detail": "连接成功"}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}

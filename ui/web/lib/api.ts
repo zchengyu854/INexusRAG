@@ -70,6 +70,19 @@ export interface Stats {
   total_size_kb: number
 }
 
+export interface LLMProvider {
+  id: string
+  name: string
+  model: string
+  base_url: string
+  api_key: string
+  timeout: number
+  active: boolean
+  created_at: string
+}
+
+export type LLMProviderDraft = Omit<LLMProvider, "id" | "created_at">
+
 export async function fetchDocs(): Promise<Doc[]> {
   const res = await fetch(`${API_BASE}/documents`)
   if (!res.ok) throw new Error("Failed to fetch documents")
@@ -165,5 +178,37 @@ export async function clearConversation(conversationId: string): Promise<void> {
 export async function getStats(): Promise<Stats> {
   const res = await fetch(`${API_BASE}/stats`, { cache: "no-store" })
   if (!res.ok) throw new Error("Failed to fetch stats")
+  return res.json()
+}
+
+export async function fetchProviders(): Promise<LLMProvider[]> {
+  const res = await fetch(`${API_BASE}/llm/providers`)
+  if (!res.ok) throw new Error("Failed to fetch LLM providers")
+  return res.json()
+}
+
+export async function upsertProvider(draft: LLMProviderDraft): Promise<LLMProvider> {
+  const res = await fetch(`${API_BASE}/llm/providers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(draft),
+  })
+  if (!res.ok) throw new Error("Save provider failed")
+  return res.json()
+}
+
+export async function deleteProvider(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/llm/providers/${encodeURIComponent(id)}`, { method: "DELETE" })
+  if (!res.ok) throw new Error("Delete provider failed")
+}
+
+export async function activateProvider(id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/llm/providers/${encodeURIComponent(id)}/activate`, { method: "POST" })
+  if (!res.ok) throw new Error("Activate provider failed")
+}
+
+export async function testProvider(id: string): Promise<{ ok: boolean; detail: string }> {
+  const res = await fetch(`${API_BASE}/llm/providers/${encodeURIComponent(id)}/test`, { method: "POST" })
+  if (!res.ok) throw new Error("Test provider failed")
   return res.json()
 }

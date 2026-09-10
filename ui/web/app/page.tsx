@@ -1,6 +1,7 @@
-import { MessageCircle, Files, Network } from "lucide-react"
+import { Cpu, Files, MessageCircle, Network } from "lucide-react"
 import { DocumentList } from "@/components/document-list"
 import { ChatPage } from "@/components/chat-page"
+import { LLMSettings } from "@/components/llm-settings"
 import { getStats, type Stats } from "@/lib/api"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 
@@ -43,6 +44,9 @@ export default async function Home() {
             <TabsTrigger value="documents">
               <Files /> Documents
             </TabsTrigger>
+            <TabsTrigger value="llm">
+              <Cpu /> LLM
+            </TabsTrigger>
           </TabsList>
 
           <TabsContent value="chat" className="mt-0 min-h-0 overflow-hidden">
@@ -51,6 +55,10 @@ export default async function Home() {
 
           <TabsContent value="documents" className="mt-0 min-h-0 overflow-y-auto">
             <DocumentList />
+          </TabsContent>
+
+          <TabsContent value="llm" className="mt-0 min-h-0 overflow-y-auto">
+            <LLMSettings />
           </TabsContent>
         </Tabs>
       </div>
