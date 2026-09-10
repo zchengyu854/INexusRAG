@@ -30,6 +30,31 @@ def load_pdf_pages(path: Path | str) -> list[tuple[int, str]]:
     return pages
 
 
+def extract_page_images(path: Path | str, pages: list[int], max_per_page: int = 3) -> list[dict]:
+    """提取 PDF 指定页的嵌入图，返回 [{page, width, height, data_uri}]；页码无效或无图则跳过。"""
+    out: list[dict] = []
+    with pymupdf.open(path) as doc:
+        for page_number in sorted(set(pages)):
+            if not (1 <= page_number <= doc.page_count):
+                continue
+            page = doc[page_number - 1]
+            for img in list(page.get_images())[:max_per_page]:
+                xref, width, height = img[0], img[2], img[3]
+                if width < 40 or height < 40:  # 与 captioning 同源阈值，跳过图标
+                    continue
+                pix = pymupdf.Pixmap(doc, xref)
+                if pix.colorspace and pix.colorspace.n > 3:  # CMYK 等转 RGB
+                    pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+                png = base64.b64encode(pix.tobytes("png")).decode()
+                if len(png) > 512 * 1024:  # 单图上限，超了跳过
+                    continue
+                out.append({"page": page_number, "width": pix.width, "height": pix.height,
+                            "data_uri": f"data:image/png;base64,{png}"})
+                if len(out) >= 6:  # ponytail: 总量上限 6 张
+                    return out
+    return out
+
+
 def describe_images(page, page_number: int, min_width: int = 40, min_height: int = 40) -> str:
     """用视觉 LLM 给页面图片生成简短描述，拼入本页切片使内容可检索。"""
     from src.llm.client import get_llm

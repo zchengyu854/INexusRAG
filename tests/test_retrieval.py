@@ -24,12 +24,9 @@ class _FakePlanLLM:
         self.model = "fake"
         self._payload = payload
 
-    def _get_client(self):
-        message = types.SimpleNamespace(content=self._payload)
-        choice = types.SimpleNamespace(message=message)
-        response = types.SimpleNamespace(choices=[choice])
-        create = types.SimpleNamespace(create=lambda **kwargs: response)
-        return types.SimpleNamespace(chat=types.SimpleNamespace(completions=create))
+    def tool_call(self, prompt: str, tool: dict) -> dict:
+        import json as _json
+        return _json.loads(self._payload)
 
 
 _EMPTY_PLAN = {"subs": [], "step_back": None, "hyde": None}
@@ -65,7 +62,7 @@ class PlanTests(unittest.TestCase):
     def test_llm_failure_returns_empty_plan(self):
         class _BrokenLLM:
             enabled = True
-            def _get_client(self):
+            def tool_call(self, prompt, tool):
                 raise RuntimeError("api down")
         with patch("src.llm.client.get_llm", return_value=_BrokenLLM()):
             self.assertEqual(plan_question("问题"), _EMPTY_PLAN)

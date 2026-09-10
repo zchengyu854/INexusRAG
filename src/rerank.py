@@ -5,7 +5,6 @@ RRF 分数由 two_stage_search/rrf_merge 在行上产出（row["score"]），作
 """
 from __future__ import annotations
 
-import json
 import os
 
 _MODEL_NAME = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
@@ -33,7 +32,22 @@ def _score_cross(query: str, candidates: list[dict]) -> list[float]:
 
 
 def _score_llm(query: str, candidates: list[dict]) -> list[float]:
-    """LLM pointwise 打分：一次批量调用输出 {chunk_id: 0-10 分}；失败保持 RRF 序。"""
+    """LLM pointwise 打分（function calling 格式）：一次批量调用输出 {chunk_id: 0-10 分}；失败保持 RRF 序。"""
+    _SCORE_TOOL: dict = {
+        "name": "score_chunks",
+        "description": "按与问题的相关性对每个片段打 0-10 分（10 最相关）",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scores": {
+                    "type": "object",
+                    "description": "键为片段 id，值为 0-10 的相关性分",
+                    "additionalProperties": {"type": "number"},
+                },
+            },
+            "required": ["scores"],
+        },
+    }
     from src.llm.client import get_llm
 
     llm = get_llm()
@@ -41,20 +55,11 @@ def _score_llm(query: str, candidates: list[dict]) -> list[float]:
         return _score_rrf(candidates)
     listing = "\n".join(f"{c['chunk_id']}: {c['text'][:200]}" for c in candidates)
     try:
-        response = llm._get_client().chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": (
-                    "对每个片段与问题的相关性打 0-10 分（10 最相关）。"
-                    '只输出 JSON 对象，键为片段 id，如 {"c-1": 8, "c-2": 3}。')},
-                {"role": "user", "content": f"问题：{query}\n片段：\n{listing}"},
-            ],
-            temperature=0,
-        )
-        data = json.loads((response.choices[0].message.content or "{}").strip().removeprefix("```json").removeprefix("```").strip())
+        data = llm.tool_call(f"问题：{query}\n片段：\n{listing}", _SCORE_TOOL)
+        data = data.get("scores", {})
         return [float(data.get(c["chunk_id"], c.get("score", 0.0))) for c in candidates]
     except Exception:
-        return _score_rrf(candidates)
+        return _score_rrf(query, candidates)
 
 
 def _score_colbert(query: str, candidates: list[dict]) -> list[float]:

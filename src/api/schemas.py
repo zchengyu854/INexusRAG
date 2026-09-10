@@ -43,8 +43,16 @@ class ConversationSummary(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: list[Source] = []
+    figures: list["Figure"] = []  # 命中图片切片时按页提取的嵌入图（base64 data URI）
     latency_ms: float = 0.0
     conversation_id: str | None = None
+
+
+class Figure(BaseModel):
+    page: int
+    width: int
+    height: int
+    data_uri: str
 
 
 class DocInfo(BaseModel):

@@ -1,7 +1,6 @@
 """混合检索：向量通道 + 关键词通道，RRF（倒数排名融合）合并；复杂问题多查询分解。"""
 from __future__ import annotations
 
-import json
 import re
 
 import jieba
@@ -97,8 +96,34 @@ def two_stage_search(query_embedding: list[float], top_k: int, terms: list[str],
     return rrf_merge(channels, top_k)
 
 
+# function-calling 检索规划 schema：三项各带判据，LLM 按 schema 填参（不适用留空）
+_PLAN_TOOL: dict = {
+    "name": "plan_question",
+    "description": "判断 subs/step_back/hyde 三项是否适用本题，不适用留 null/[]",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "subs": {
+                "type": "array",
+                "maxItems": 5,
+                "description": "子问题：问题含多个子主题时拆成不超过 5 个可独立检索回答的具体子问题；已够具体则 []",
+                "items": {"type": "string"},
+            },
+            "step_back": {
+                "type": "string",
+                "description": "退步概念问题：问题过于细节具体时，退一步写更宽泛的概念问题（答案需包含回答原问题的背景）；已够抽象则 null",
+            },
+            "hyde": {
+                "type": "string",
+                "description": "假想文档片段：150~300 字中文段落，描述回答该问题的文档会包含的关键信息（概念、术语、因果）；不直接答题；简单事实型问题置 null",
+            },
+        },
+    },
+}
+
+
 def plan_question(question: str) -> dict:
-    """检索规划：一次 LLM 调用决定子问题/退步抽象/HyDE 段落三项（不用则留空），让 LLM 自行门控。
+    """检索规划：一次 LLM 调用（function calling 格式）决定子问题/退步抽象/HyDE 段落三项，让 LLM 自行门控。
 
     LLM 不可用或输出不合法时返回全空计划——检索永远不退化为失败。"""
     empty = {"subs": [], "step_back": None, "hyde": None}
@@ -108,27 +133,7 @@ def plan_question(question: str) -> dict:
     if not llm.enabled:
         return empty
     try:
-        response = llm._get_client().chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": (
-                    "你是检索规划器，为问题规划检索通道，判断三项：\n"
-                    "1. subs: 若问题包含多个子主题，拆成不超过 5 个可被单次检索独立回答的具体子问题；"
-                    "问题已足够具体则留空数组。\n"
-                    "2. step_back: 若问题过于细节具体，退一步写一个更宽泛的概念问题，"
-                    "其答案包含回答原问题所需的知识背景；已够抽象则置 null。\n"
-                    "3. hyde: 写一段 150~300 字中文段落，描述回答该问题的文档会包含哪些关键信息"
-                    "（具体概念、术语、因果关系），使语义嵌入接近真实相关文档；不直接答题、不声明假设，"
-                    "简单事实型问题可置 null。\n"
-                    '只输出 JSON 对象: {"subs": [], "step_back": null, "hyde": null}')},
-                {"role": "user", "content": question},
-            ],
-            temperature=0,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`").removeprefix("json").strip()
-        data = json.loads(raw)
+        data = llm.tool_call(question, _PLAN_TOOL)
         subs = [str(s).strip() for s in data.get("subs", []) if str(s).strip()][:5]
         step = data.get("step_back")
         hyde = data.get("hyde")
