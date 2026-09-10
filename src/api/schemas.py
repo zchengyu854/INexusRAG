@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 # 检索特性开关；None（不传）= 默认全开除 rerank，显式传 = 只开列出的
-FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "rerank"]
+FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "rerank", "graph"]
 
 
 class QueryRequest(BaseModel):
@@ -14,7 +14,7 @@ class QueryRequest(BaseModel):
     conversation_id: str | None = Field(None, min_length=1, max_length=100)
     # 元数据过滤（JSONB 包含）：如 {"page": 5}、{"figure": true}；None 表示不过滤
     filters: dict[str, Any] | None = Field(None, max_length=8)
-    features: list[FeatureName] | None = Field(None, max_length=6)
+    features: list[FeatureName] | None = Field(None, max_length=7)
 
 
 class Source(BaseModel):
