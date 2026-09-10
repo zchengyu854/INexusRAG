@@ -350,6 +350,24 @@ def query(request: QueryRequest):
         )
         for result in results
     ]
+    # 命中图片切片时，按 (文档, 页) 提取嵌入图返回（无图/无源文件则空，不报错）
+    figures: list[dict] = []
+    fig_pages: dict[str, list[int]] = {}
+    for result in results:
+        meta = result.get("metadata") or {}
+        if meta.get("figure") and result.get("document_id") and meta.get("page"):
+            fig_pages.setdefault(result["document_id"], []).append(int(meta["page"]))
+    if fig_pages:
+        try:
+            from src.ingestion.loaders import extract_page_images
+            for doc_id, page_list in fig_pages.items():
+                doc = get_document(doc_id)
+                src = (doc or {}).get("source_path", "")
+                if not src or not Path(src).exists():
+                    continue
+                figures.extend(extract_page_images(src, page_list))
+        except Exception:  # 取图失败不影响主回答
+            pass
     answer = get_llm().generate(request.question, results, history=history)
     source_data = [source.model_dump() for source in sources]
     save_message(conversation_id, "assistant", answer, source_data)
@@ -358,6 +376,7 @@ def query(request: QueryRequest):
     return QueryResponse(
         answer=answer,
         sources=sources,
+        figures=figures,
         latency_ms=latency_ms,
         conversation_id=conversation_id,
     )

@@ -24,11 +24,8 @@ class RerankTests(unittest.TestCase):
         class _LLM:
             enabled = True
             model = "fake"
-            def _get_client(self):
-                import types
-                message = types.SimpleNamespace(content='{"c-2": 9, "c-0": 1}')
-                return types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(
-                    create=lambda **kw: types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)]))))
+            def tool_call(self, prompt: str, tool: dict) -> dict:
+                return {"scores": {"c-2": 9, "c-0": 1}}
         with patch.dict("os.environ", {"RERANK_STRATEGY": "llm"}), \
              patch("src.llm.client.get_llm", return_value=_LLM()):
             out = rerank("q", [cand(0), cand(1), cand(2)], 3)

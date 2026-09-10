@@ -46,6 +46,13 @@ export interface Source {
   score?: number
 }
 
+export interface Figure {
+  page: number
+  width: number
+  height: number
+  data_uri: string
+}
+
 export interface PreviewResult {
   total_chunks: number
   chunks: Chunk[]
@@ -155,7 +162,7 @@ export async function queryDoc(
   topK = 5,
   filters?: Record<string, string | number | boolean>,
   features?: string[]
-): Promise<{ answer: string; sources: Source[]; conversation_id: string; latency_ms: number }> {
+): Promise<{ answer: string; sources: Source[]; figures: Figure[]; conversation_id: string; latency_ms: number }> {
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

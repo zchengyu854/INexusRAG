@@ -78,7 +78,10 @@ class LLMClient:
                 "5. Cite important claims with the provided source markers in the format [Source N]. "
                 "Do not create citations that are not present in the source list.\n"
                 "6. Reply in the user's language unless the user asks for another language. Keep the "
-                "answer concise, clear, and well structured."
+                "answer concise, clear, and well structured.\n"
+                "7. If a retrieved source is a figure chunk (image caption), the image itself is shown "
+                "in the UI; refer to it by its page number (e.g. “第 4 页的图片”). Do NOT output "
+                "image data or markdown image links."
             ),
         }]
         messages.extend(
@@ -94,6 +97,34 @@ class LLMClient:
         )
         content = response.choices[0].message.content
         return content.strip() if content else "模型没有返回内容。"
+
+    def tool_call(
+        self,
+        prompt: str,
+        tool: dict,
+        history: list[dict] | None = None,
+    ) -> dict:
+        """Function-calling 结构化输出：强制调用 tool 并返回解析后的 JSON 参数。"""
+        messages = [{"role": "user", "content": prompt}]
+        messages.extend(
+            {"role": m["role"], "content": m["content"]}
+            for m in (history or [])
+            if m["role"] in {"user", "assistant"}
+        )
+        response = self._get_client().chat.completions.create(
+            model=self.model,
+            temperature=0,
+            messages=messages,
+            tools=[{"type": "function", "function": tool}],
+            # 对象形式：部分网关（OpenAI 兼容）不接受字符串简写
+            tool_choice={"type": "function", "function": {"name": tool["name"]}},
+        )
+        tool_calls = response.choices[0].message.tool_calls
+        if not tool_calls:
+            raise ValueError("模型未按 function calling 格式返回")
+        import json as _json
+
+        return _json.loads(tool_calls[0].function.arguments or "{}")
 
 
 def get_llm() -> LLMClient:
