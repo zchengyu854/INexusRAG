@@ -321,7 +321,7 @@ def query(request: QueryRequest):
             conversation_id=conversation_id,
         )
 
-    results = multi_query_search(request.question, top_k=request.top_k, filters=request.filters)
+    results = multi_query_search(request.question, top_k=request.top_k, filters=request.filters, features=request.features)
     if not results:
         answer = "未检索到相关内容，请先上传并入库文档。"
         save_message(conversation_id, "assistant", answer)

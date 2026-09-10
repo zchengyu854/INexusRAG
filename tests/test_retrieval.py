@@ -71,6 +71,44 @@ class PlanTests(unittest.TestCase):
             self.assertEqual(plan_question("问题"), _EMPTY_PLAN)
 
 
+    def test_two_stage_search_no_routing_is_global_vector_only(self):
+        with patch("src.retrieval.search_doc_index") as sdi, \
+             patch("src.retrieval.search_chunks", return_value=[row("a")]), \
+             patch("src.retrieval.keyword_chunks", return_value=[]):
+            two_stage_search([0.0], top_k=2, terms=[], use_routing=False)
+            sdi.assert_not_called()
+
+    def test_multi_query_search_features_off_skips_planning_and_uses_single_channel(self):
+        with patch("src.retrieval.two_stage_search", return_value=[row("a")]) as tss, \
+             patch("src.retrieval.plan_question") as plan, \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.return_value = [[0.0]]
+            multi_query_search("原始问题", top_k=2, features=[])
+            plan.assert_not_called()  # 规划类特性全关 → 不付 LLM 调用
+            self.assertEqual(len(tss.call_args_list), 1)
+            self.assertEqual(tss.call_args_list[0].kwargs, {"top_k": 2, "terms": [], "filters": None, "use_routing": False})
+
+    def test_multi_query_search_features_keywords_only_disables_routing(self):
+        with patch("src.retrieval.two_stage_search", return_value=[row("a")]) as tss, \
+             patch("src.retrieval.plan_question", return_value={"subs": ["子"], "step_back": None, "hyde": None}) as plan, \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.return_value = [[0.0]]
+            multi_query_search("原始问题", top_k=2, features=["keywords"])
+            plan.assert_not_called()  # keywords 不属于规划类
+            self.assertTrue(all(not c.kwargs["use_routing"] for c in tss.call_args_list))
+            self.assertTrue(all(c.kwargs["terms"] for c in tss.call_args_list))
+
+    def test_multi_query_search_default_features_keeps_current_behavior(self):
+        with patch("src.retrieval.two_stage_search", return_value=[]) as tss, \
+             patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.return_value = [[0.0]]
+            multi_query_search("原始问题", top_k=2)
+            # 默认 = 路由+关键词开，无 rerank
+            self.assertTrue(all(c.kwargs["use_routing"] for c in tss.call_args_list))
+            self.assertTrue(all(c.kwargs["terms"] for c in tss.call_args_list))
+
+
 class RetrievalTests(unittest.TestCase):
     def test_term_in_both_channels_ranks_first(self):
         vector = [row("a"), row("b"), row("c")]
@@ -141,7 +179,7 @@ class RetrievalTests(unittest.TestCase):
         self.assertLess(len(summary), 320)
 
     def test_multi_query_search_merges_subquestion_channels(self):
-        def fake_tss(vec, top_k, terms, filters=None):
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True):
             return [{"chunk_id": f"c-{i}", "text": f"{terms}-{i}"} for i in range(top_k)]
 
         plan = {"subs": ["子问题 A", "子问题 B"], "step_back": None, "hyde": None}
