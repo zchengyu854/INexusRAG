@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber"
-import { Html, OrbitControls } from "@react-three/drei"
+import { Html, Line as DreiLine, OrbitControls } from "@react-three/drei"
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib"
 import * as THREE from "three"
 
@@ -246,28 +246,22 @@ function EdgeLine({
   weight: number
   highlight: Set<string>
 }) {
-  const geometry = useMemo(() => {
-    const g = new THREE.BufferGeometry().setFromPoints([from, to])
-    return g
-  }, [from, to])
+  const points = useMemo(() => [from, to], [from, to])
 
-  useEffect(() => {
-    return () => geometry.dispose()
-  }, [geometry])
-
+  // 注意：lineBasicMaterial.linewidth 在 WebGL 里被强制为 1px（three.js 的平台限制），
+  // 必须用 drei 的 Line（Line2/LineMaterial）才能真正画出粗线。
+  // 颜色用 slate-500 而非 slate-400：浅色背景下 0.35 透明度的 slate-400 与背景几乎同色。
   const dimmed = highlight.size > 0 && !focus
-  const opacity = dimmed ? 0.06 : focus ? 0.85 : 0.35
-  const lineWidth = Math.min(0.4 + Math.log2(Math.max(weight, 1)) * 0.6, 3)
+  const opacity = dimmed ? 0.14 : focus ? 0.95 : 0.55
+  const lineWidth = focus ? 2.5 : Math.min(1 + Math.log2(Math.max(weight, 1)) * 0.5, 2.2)
   return (
-    <line>
-      <primitive attach="geometry" object={geometry} />
-      <lineBasicMaterial
-        color={focus ? "#f97316" : "#94a3b8"}
-        transparent
-        opacity={opacity}
-        linewidth={lineWidth}
-      />
-    </line>
+    <DreiLine
+      points={points}
+      color={focus ? "#f97316" : "#64748b"}
+      lineWidth={lineWidth}
+      transparent
+      opacity={opacity}
+    />
   )
 }
 
