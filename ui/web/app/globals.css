@@ -1,6 +1,10 @@
 @import "tailwindcss";
 
-@custom-variant dark (&:where(.dark, .dark *));
+/*
+ * 主题策略：浅色为默认，深色通过 prefers-color-scheme 跟随系统。
+ * 因此**不使用**基于 `.dark` 类的 custom variant —— 移除后 `dark:` 工具类会走
+ * Tailwind v4 的默认行为（媒体查询），shadcn 组件里的 dark: 修饰符即可自动适配。
+ */
 
 @theme inline {
   --color-background: var(--background);
@@ -49,38 +53,67 @@
   --animate-pulse-soft: pulse-soft 1.6s ease-in-out infinite;
 }
 
-/*
- * 只维护一套深色 token。此前的 `:root, .dark` 写法两套值完全相同，
- * 等于一个空壳浅色主题；ThemeToggle 也从未被引用，故一并移除。
- */
+/* 浅色（默认）：冷白分层 —— 页面底浅灰、卡片纯白，层次靠明度而非描边 */
 :root {
   --radius: 8px;
-  --background: oklch(0.15 0.014 265);
-  --foreground: oklch(0.93 0.004 260);
-  --card: oklch(0.19 0.014 265);
-  --card-foreground: oklch(0.93 0.004 260);
-  --popover: oklch(0.21 0.016 265);
-  --popover-foreground: oklch(0.93 0.004 260);
-  --primary: oklch(0.68 0.19 45);
-  --primary-foreground: oklch(0.15 0.02 45);
-  --secondary: oklch(0.23 0.014 265);
-  --secondary-foreground: oklch(0.93 0.004 260);
-  --muted: oklch(0.22 0.014 265);
-  --muted-foreground: oklch(0.58 0.018 260);
-  --accent: oklch(0.26 0.05 45);
-  --accent-foreground: oklch(0.78 0.15 50);
-  --destructive: oklch(0.62 0.2 25);
-  --destructive-foreground: oklch(0.97 0 0);
-  --success: oklch(0.72 0.16 150);
-  --success-foreground: oklch(0.17 0.03 150);
-  --warning: oklch(0.79 0.15 80);
-  --warning-foreground: oklch(0.2 0.03 80);
-  --info: oklch(0.72 0.13 245);
-  --info-foreground: oklch(0.17 0.03 245);
-  --border: oklch(1 0 0 / 0.1);
-  --border-strong: oklch(1 0 0 / 0.2);
-  --input: oklch(1 0 0 / 0.14);
-  --ring: oklch(0.68 0.19 45);
+  --background: oklch(0.973 0.003 265);
+  --foreground: oklch(0.21 0.012 265);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.012 265);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.012 265);
+  --primary: oklch(0.55 0.19 40);
+  --primary-foreground: oklch(0.99 0.008 60);
+  --secondary: oklch(0.962 0.004 265);
+  --secondary-foreground: oklch(0.25 0.012 265);
+  --muted: oklch(0.962 0.004 265);
+  --muted-foreground: oklch(0.53 0.014 260);
+  --accent: oklch(0.955 0.025 60);
+  --accent-foreground: oklch(0.45 0.15 45);
+  --destructive: oklch(0.55 0.21 25);
+  --destructive-foreground: oklch(0.99 0.005 25);
+  --success: oklch(0.53 0.14 150);
+  --success-foreground: oklch(0.99 0.005 150);
+  --warning: oklch(0.6 0.13 75);
+  --warning-foreground: oklch(0.99 0.005 75);
+  --info: oklch(0.54 0.15 250);
+  --info-foreground: oklch(0.99 0.005 250);
+  --border: oklch(0.905 0.005 265);
+  --border-strong: oklch(0.84 0.006 265);
+  --input: oklch(0.9 0.005 265);
+  --ring: oklch(0.55 0.19 40);
+}
+
+/* 深色：跟随系统偏好 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.15 0.014 265);
+    --foreground: oklch(0.93 0.004 260);
+    --card: oklch(0.19 0.014 265);
+    --card-foreground: oklch(0.93 0.004 260);
+    --popover: oklch(0.21 0.016 265);
+    --popover-foreground: oklch(0.93 0.004 260);
+    --primary: oklch(0.68 0.19 45);
+    --primary-foreground: oklch(0.15 0.02 45);
+    --secondary: oklch(0.23 0.014 265);
+    --secondary-foreground: oklch(0.93 0.004 260);
+    --muted: oklch(0.22 0.014 265);
+    --muted-foreground: oklch(0.58 0.018 260);
+    --accent: oklch(0.26 0.05 45);
+    --accent-foreground: oklch(0.78 0.15 50);
+    --destructive: oklch(0.62 0.2 25);
+    --destructive-foreground: oklch(0.97 0 0);
+    --success: oklch(0.72 0.16 150);
+    --success-foreground: oklch(0.17 0.03 150);
+    --warning: oklch(0.79 0.15 80);
+    --warning-foreground: oklch(0.2 0.03 80);
+    --info: oklch(0.72 0.13 245);
+    --info-foreground: oklch(0.17 0.03 245);
+    --border: oklch(1 0 0 / 0.1);
+    --border-strong: oklch(1 0 0 / 0.2);
+    --input: oklch(1 0 0 / 0.14);
+    --ring: oklch(0.68 0.19 45);
+  }
 }
 
 * {
@@ -89,7 +122,7 @@
 }
 
 html {
-  color-scheme: dark;
+  color-scheme: light dark;
 }
 
 body {

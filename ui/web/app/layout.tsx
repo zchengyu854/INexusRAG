@@ -18,12 +18,15 @@ export const metadata: Metadata = {
 }
 
 export const viewport: Viewport = {
-  themeColor: "#0d0f16",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f7f7f9" },
+    { media: "(prefers-color-scheme: dark)", color: "#0d0f16" },
+  ],
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className="dark">
+    <html lang="zh-CN">
       <body className={`${outfit.variable} ${geistMono.variable} min-h-dvh overflow-hidden bg-background text-foreground`}>
         {children}
       </body>

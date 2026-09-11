@@ -1,91 +1,284 @@
 "use client"
 
-import { useMemo } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Canvas, useFrame, useThree, type ThreeEvent } from "@react-three/fiber"
+import { Html, OrbitControls } from "@react-three/drei"
+import type { OrbitControls as OrbitControlsImpl } from "three-stdlib"
+import * as THREE from "three"
 
+import { kindHex, kindLabel, nodeRadius } from "@/components/graph/kind-meta"
 import type { GraphLink, GraphNode } from "@/lib/api"
 
-const WIDTH = 820
-const HEIGHT = 620
+const SPHERE_RADIUS = 4.5
+const DAMPING = 0.08
+const AUTO_SPIN_RAD_PER_SEC = 0.18
 
-/** 类型 → 颜色只取设计系统里已有的语义色，不引入额外色板。 */
-const KIND_COLOR: Record<string, string> = {
-  concept: "var(--info)",
-  method: "var(--primary)",
-  metric: "var(--success)",
-  product: "var(--warning)",
-  org: "var(--warning)",
-  person: "var(--warning)",
-  other: "var(--muted-foreground)",
-}
+/** 给定 N 个节点的 hop 分层与角度：hop=0 在中心（最多 3 个贴近原点），hop=1/2/... 在不同球壳上均匀分布。
+ *  使用确定性算法 —— 同一组 nodes 永远得到同一组坐标，旋转只是用户视角。 */
+function layoutPositions(nodes: GraphNode[]): Map<string, THREE.Vector3> {
+  const out = new Map<string, THREE.Vector3>()
+  const anchors = nodes.filter((node) => node.hop === 0)
+  const h1 = nodes.filter((node) => node.hop === 1)
+  const h2 = nodes.filter((node) => node.hop === 2)
+  const rest = nodes.filter((node) => node.hop > 2)
 
-const KIND_LABEL: Record<string, string> = {
-  concept: "概念",
-  product: "产品",
-  metric: "指标",
-  method: "方法",
-  person: "人物",
-  org: "组织",
-  other: "其他",
-}
-
-export function kindColor(kind: string): string {
-  return KIND_COLOR[kind] ?? KIND_COLOR.other
-}
-
-export function kindLabel(kind: string): string {
-  return KIND_LABEL[kind] ?? kind
-}
-
-function truncate(text: string, max: number): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text
-}
-
-/**
- * 确定性径向布局：锚点居中，hop=1/2 的实体按跳数分环均布。
- *
- * 说明：原方案建议用 d3-force，但项目未引入该依赖；力导向的节点位置每次渲染都会漂移，
- * 对"点开一个实体看它的两跳邻居"这种场景反而不如固定布局稳定，故改为无依赖的环状布局。
- */
-function useLayout(nodes: GraphNode[]) {
-  return useMemo(() => {
-    const cx = WIDTH / 2
-    const cy = HEIGHT / 2
-    const ringRadius = [0, Math.min(WIDTH, HEIGHT) * 0.29, Math.min(WIDTH, HEIGHT) * 0.45]
-    const positions = new Map<string, { x: number; y: number }>()
-
-    const anchors = nodes.filter((node) => node.hop === 0)
+  // 锚点：≤3 时贴近原点；>3 时排在第一壳
+  if (anchors.length <= 3) {
     anchors.forEach((node, index) => {
-      if (anchors.length === 1) {
-        positions.set(node.entity_id, { x: cx, y: cy })
-        return
-      }
-      const angle = (2 * Math.PI * index) / anchors.length
-      positions.set(node.entity_id, { x: cx + 46 * Math.cos(angle), y: cy + 46 * Math.sin(angle) })
+      const a = (index / Math.max(anchors.length, 1)) * Math.PI * 2
+      out.set(node.entity_id, new THREE.Vector3(Math.cos(a) * 0.6, Math.sin(a) * 0.6, 0))
     })
-
-    for (const hop of [1, 2]) {
-      const ring = nodes.filter((node) => node.hop === hop)
-      const radius = ringRadius[Math.min(hop, ringRadius.length - 1)]
-      ring.forEach((node, index) => {
-        const angle = (2 * Math.PI * index) / Math.max(ring.length, 1) - Math.PI / 2
-        positions.set(node.entity_id, {
-          x: cx + radius * Math.cos(angle),
-          y: cy + radius * Math.sin(angle),
-        })
-      })
-    }
-
-    const rest = nodes.filter((node) => !positions.has(node.entity_id))
-    rest.forEach((node, index) => {
-      const angle = (2 * Math.PI * index) / Math.max(rest.length, 1)
-      positions.set(node.entity_id, {
-        x: cx + ringRadius[2] * Math.cos(angle),
-        y: cy + ringRadius[2] * Math.sin(angle),
-      })
+  } else {
+    anchors.forEach((node, index) => {
+      const a = (index / anchors.length) * Math.PI * 2
+      out.set(node.entity_id, spherePoint(a, 0, SPHERE_RADIUS * 0.35))
     })
+  }
 
-    return positions
-  }, [nodes])
+  const shells: { items: GraphNode[]; radius: number }[] = [
+    { items: h1, radius: SPHERE_RADIUS * 0.55 },
+    { items: h2, radius: SPHERE_RADIUS * 0.85 },
+    { items: rest, radius: SPHERE_RADIUS },
+  ]
+
+  for (const { items, radius } of shells) {
+    if (!items.length) continue
+    const phiOffset = items.length * 0.61803398875 * Math.PI  // 黄金角偏移，避免同层节点共线
+    items.forEach((node, index) => {
+      const phi = Math.acos(1 - (2 * (index + 0.5)) / items.length)
+      const theta = phiOffset + index * 2.39996323
+      out.set(node.entity_id, spherePointFromPhiTheta(phi, theta, radius))
+    })
+  }
+
+  return out
+}
+
+function spherePoint(theta: number, phi: number, radius: number): THREE.Vector3 {
+  return spherePointFromPhiTheta(phi, theta, radius)
+}
+
+function spherePointFromPhiTheta(phi: number, theta: number, radius: number): THREE.Vector3 {
+  return new THREE.Vector3(
+    radius * Math.sin(phi) * Math.cos(theta),
+    radius * Math.cos(phi),
+    radius * Math.sin(phi) * Math.sin(theta),
+  )
+}
+
+interface SceneProps {
+  nodes: GraphNode[]
+  edges: GraphLink[]
+  positions: Map<string, THREE.Vector3>
+  selectedId: string | null
+  highlight: Set<string>
+  onSelect: (id: string) => void
+  onExpand: (id: string) => void
+}
+
+function Scene({ nodes, edges, positions, selectedId, highlight, onSelect, onExpand }: SceneProps) {
+  const group = useRef<THREE.Group>(null)
+
+  useFrame((_, delta) => {
+    if (!group.current) return
+    // 自动缓慢自转；用户交互期间 OrbitControls 接管，rotateY 不会冲突
+    group.current.rotation.y += AUTO_SPIN_RAD_PER_SEC * delta
+  })
+
+  return (
+    <group ref={group}>
+      <ambientLight intensity={0.85} />
+      <directionalLight position={[6, 6, 6]} intensity={0.7} />
+      <directionalLight position={[-6, -3, -4]} intensity={0.35} />
+
+      {edges.map((edge, index) => {
+        const from = positions.get(edge.src)
+        const to = positions.get(edge.dst)
+        if (!from || !to) return null
+        const isFocus = selectedId === edge.src || selectedId === edge.dst
+        return (
+          <EdgeLine
+            key={`${edge.src}-${edge.dst}-${index}`}
+            from={from}
+            to={to}
+            focus={isFocus}
+            weight={edge.weight}
+            highlight={highlight}
+          />
+        )
+      })}
+
+      {nodes.map((node) => {
+        const point = positions.get(node.entity_id)
+        if (!point) return null
+        const radius = nodeRadius(node, 0.45)
+        const selected = node.entity_id === selectedId
+        const dimmed = highlight.size > 0 && !highlight.has(node.entity_id) && !selected
+        return (
+          <NodeSphere
+            key={node.entity_id}
+            position={point}
+            radius={radius}
+            color={kindHex(node.kind)}
+            selected={selected}
+            dimmed={dimmed}
+            label={node.name}
+            kindLabel={kindLabel(node.kind)}
+            mentions={node.mentions}
+            anchor={node.hop === 0}
+            onClick={() => onSelect(node.entity_id)}
+            onDoubleClick={() => onExpand(node.entity_id)}
+          />
+        )
+      })}
+    </group>
+  )
+}
+
+function NodeSphere({
+  position,
+  radius,
+  color,
+  selected,
+  dimmed,
+  label,
+  kindLabel,
+  mentions,
+  anchor,
+  onClick,
+  onDoubleClick,
+}: {
+  position: THREE.Vector3
+  radius: number
+  color: string
+  selected: boolean
+  dimmed: boolean
+  label: string
+  kindLabel: string
+  mentions: number
+  anchor: boolean
+  onClick: () => void
+  onDoubleClick: () => void
+}) {
+  const mesh = useRef<THREE.Mesh>(null)
+  const [hover, setHover] = useState(false)
+
+  // 选中时让球面有轻微脉动，避免静态感
+  useFrame((state) => {
+    if (!mesh.current) return
+    const t = state.clock.elapsedTime
+    const pulse = selected ? 1 + Math.sin(t * 2.4) * 0.06 : 1
+    mesh.current.scale.setScalar(pulse)
+  })
+
+  return (
+    <group position={position}>
+      <mesh
+        ref={mesh}
+        onPointerOver={(event: ThreeEvent<PointerEvent>) => {
+          event.stopPropagation()
+          setHover(true)
+          document.body.style.cursor = "pointer"
+        }}
+        onPointerOut={() => {
+          setHover(false)
+          document.body.style.cursor = "default"
+        }}
+        onClick={(event: ThreeEvent<MouseEvent>) => {
+          event.stopPropagation()
+          onClick()
+        }}
+        onDoubleClick={(event: ThreeEvent<MouseEvent>) => {
+          event.stopPropagation()
+          onDoubleClick()
+        }}
+      >
+        <sphereGeometry args={[radius, 24, 24]} />
+        <meshStandardMaterial
+          color={color}
+          emissive={color}
+          emissiveIntensity={selected ? 0.6 : hover ? 0.35 : 0.15}
+          roughness={0.4}
+          metalness={0.2}
+          transparent={dimmed}
+          opacity={dimmed ? 0.25 : 1}
+        />
+      </mesh>
+      {anchor ? (
+        <mesh>
+          <sphereGeometry args={[radius * 1.55, 24, 24]} />
+          <meshBasicMaterial color={color} transparent opacity={0.18} />
+        </mesh>
+      ) : null}
+      {(hover || selected) ? (
+        <Html
+          center
+          distanceFactor={10}
+          style={{
+            pointerEvents: "none",
+            background: "var(--popover)",
+            color: "var(--popover-foreground)",
+            padding: "4px 8px",
+            borderRadius: 6,
+            fontSize: 11,
+            border: "1px solid var(--border)",
+            whiteSpace: "nowrap",
+            boxShadow: "0 4px 12px rgb(0 0 0 / 0.12)",
+          }}
+        >
+          {`${label} · ${kindLabel} · ${mentions} 次`}
+        </Html>
+      ) : null}
+    </group>
+  )
+}
+
+function EdgeLine({
+  from,
+  to,
+  focus,
+  weight,
+  highlight,
+}: {
+  from: THREE.Vector3
+  to: THREE.Vector3
+  focus: boolean
+  weight: number
+  highlight: Set<string>
+}) {
+  const geometry = useMemo(() => {
+    const g = new THREE.BufferGeometry().setFromPoints([from, to])
+    return g
+  }, [from, to])
+
+  useEffect(() => {
+    return () => geometry.dispose()
+  }, [geometry])
+
+  const dimmed = highlight.size > 0 && !focus
+  const opacity = dimmed ? 0.06 : focus ? 0.85 : 0.35
+  const lineWidth = Math.min(0.4 + Math.log2(Math.max(weight, 1)) * 0.6, 3)
+  return (
+    <line>
+      <primitive attach="geometry" object={geometry} />
+      <lineBasicMaterial
+        color={focus ? "#f97316" : "#94a3b8"}
+        transparent
+        opacity={opacity}
+        linewidth={lineWidth}
+      />
+    </line>
+  )
+}
+
+function CameraAutoFit({ count }: { count: number }) {
+  const { camera } = useThree()
+  useEffect(() => {
+    // 节点越多拉远一点，避免拥挤
+    const target = 5 + count * 0.02
+    camera.position.setLength(Math.max(camera.position.length(), target))
+  }, [count, camera])
+  return null
 }
 
 export function GraphCanvas({
@@ -101,79 +294,61 @@ export function GraphCanvas({
   onSelect: (entityId: string) => void
   onExpand: (entityId: string) => void
 }) {
-  const positions = useLayout(nodes)
+  const positions = useMemo(() => layoutPositions(nodes), [nodes])
+  const highlight = useMemo(() => {
+    if (!selectedId) return new Set<string>()
+    const set = new Set<string>([selectedId])
+    for (const edge of edges) {
+      if (edge.src === selectedId) set.add(edge.dst)
+      if (edge.dst === selectedId) set.add(edge.src)
+    }
+    return set
+  }, [edges, selectedId])
+
+  const orbitRef = useRef<OrbitControlsImpl | null>(null)
 
   return (
-    <svg
-      viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-      width="100%"
-      height="100%"
-      preserveAspectRatio="xMidYMid meet"
-      role="img"
-      className="select-none"
-    >
-      <g>
-        {edges.map((edge, index) => {
-          const from = positions.get(edge.src)
-          const to = positions.get(edge.dst)
-          if (!from || !to) return null
-          const touchesSelection = selectedId === edge.src || selectedId === edge.dst
-          return (
-            <line
-              key={`${edge.src}-${edge.dst}-${index}`}
-              x1={from.x}
-              y1={from.y}
-              x2={to.x}
-              y2={to.y}
-              stroke={touchesSelection ? "var(--primary)" : "var(--border-strong)"}
-              strokeWidth={Math.min(1 + edge.weight * 0.5, 3)}
-              opacity={touchesSelection ? 0.9 : 0.5}
-            />
-          )
-        })}
-      </g>
+    <div className="relative h-full w-full overflow-hidden rounded-md border border-[var(--border)] bg-[var(--background)]">
+      <Canvas
+        camera={{ position: [6, 4, 7], fov: 50 }}
+        dpr={[1, 2]}
+        onPointerMissed={() => onSelect("")}
+        gl={{ antialias: true, alpha: true }}
+      >
+        <CameraAutoFit count={nodes.length} />
+        <Scene
+          nodes={nodes}
+          edges={edges}
+          positions={positions}
+          selectedId={selectedId}
+          highlight={highlight}
+          onSelect={onSelect}
+          onExpand={onExpand}
+        />
+        <OrbitControls
+          ref={orbitRef}
+          enablePan
+          enableZoom
+          enableRotate
+          enableDamping
+          dampingFactor={DAMPING}
+          rotateSpeed={0.8}
+          minDistance={3}
+          maxDistance={20}
+          autoRotate={false}
+        />
+      </Canvas>
+      <OverlayHints />
+    </div>
+  )
+}
 
-      <g>
-        {nodes.map((node) => {
-          const point = positions.get(node.entity_id)
-          if (!point) return null
-          const radius = Math.min(7 + node.mentions * 0.6, 22)
-          const selected = node.entity_id === selectedId
-          const anchor = node.hop === 0
-          return (
-            <g
-              key={node.entity_id}
-              className="cursor-pointer"
-              onClick={() => onSelect(node.entity_id)}
-              onDoubleClick={() => onExpand(node.entity_id)}
-            >
-              <title>{`${node.name}（${kindLabel(node.kind)}）· 被提及 ${node.mentions} 次\n单击查看详情，双击以此为中心`}</title>
-              {anchor && !selected ? (
-                <circle cx={point.x} cy={point.y} r={radius + 5} fill="none" stroke={kindColor(node.kind)} strokeWidth={1} opacity={0.5} />
-              ) : null}
-              <circle
-                cx={point.x}
-                cy={point.y}
-                r={radius}
-                fill={selected ? "var(--primary)" : kindColor(node.kind)}
-                stroke={selected ? "var(--background)" : "var(--background)"}
-                strokeWidth={1.5}
-                opacity={selected || anchor ? 1 : 0.85}
-              />
-              <text
-                x={point.x}
-                y={point.y + radius + 11}
-                textAnchor="middle"
-                fontSize={11}
-                fill={selected ? "var(--primary)" : "var(--muted-foreground)"}
-                className="pointer-events-none"
-              >
-                {truncate(node.name, 14)}
-              </text>
-            </g>
-          )
-        })}
-      </g>
-    </svg>
+function OverlayHints() {
+  return (
+    <div className="pointer-events-none absolute bottom-3 left-3 flex gap-1.5 text-[11px] text-[var(--muted-foreground)]">
+      <span className="rounded bg-[var(--popover)] px-2 py-1 shadow-sm border border-[var(--border)]">拖拽旋转</span>
+      <span className="rounded bg-[var(--popover)] px-2 py-1 shadow-sm border border-[var(--border)]">滚轮缩放</span>
+      <span className="rounded bg-[var(--popover)] px-2 py-1 shadow-sm border border-[var(--border)]">双击节点换中心</span>
+    </div>
   )
 }

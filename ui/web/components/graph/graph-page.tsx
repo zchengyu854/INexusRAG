@@ -1,10 +1,11 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import { useCallback, useEffect, useState } from "react"
 import { Loader2, RefreshCw, Search } from "lucide-react"
 
 import { EntityDetail } from "@/components/graph/entity-detail"
-import { GraphCanvas, kindLabel } from "@/components/graph/graph-canvas"
+import { kindLabel } from "@/components/graph/kind-meta"
 import { Button } from "@/components/ui/button"
 import {
   getGraphEntity,
@@ -19,6 +20,20 @@ import {
 import { cn } from "@/lib/utils"
 
 const KIND_ORDER = ["concept", "method", "metric", "product", "org", "person", "other"]
+
+/** three.js 依赖 WebGL，服务端渲染没有意义且会触发 hydration 警告，故只在客户端加载。 */
+const GraphCanvas = dynamic(
+  () => import("@/components/graph/graph-canvas").then((m) => m.GraphCanvas),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-full items-center justify-center gap-2 text-body text-muted-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        正在加载三维画布…
+      </div>
+    ),
+  },
+)
 
 export function GraphPage() {
   const [stats, setStats] = useState<GraphStats | null>(null)

@@ -3,7 +3,7 @@
 import Link from "next/link"
 import { Loader2 } from "lucide-react"
 
-import { kindColor, kindLabel } from "@/components/graph/graph-canvas"
+import { kindColor, kindLabel } from "@/components/graph/kind-meta"
 import { Panel, PanelBody, PanelHeader, PanelSection } from "@/components/ui/panel"
 import type { GraphEdge, GraphEntityDetail } from "@/lib/api"
 
