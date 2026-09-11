@@ -72,7 +72,15 @@ def index_document_route(doc_id: str, doc_name: str, chunks: list, encode) -> No
 
 
 _ROUTE_TOP = 3
-_MIN_ROUTE_SCORE = 0.3  # ponytail: 余弦阈值未校准（bge-m3），观测到路由漏检后调
+# 路由置信度不足时补一路全局向量兜底。
+# 校准（2026-09-11，8 篇文档 / 7077 切片 / bge-m3 1024 维，脚本 scripts/calibrate_thresholds.py）：
+# 查询路由 top-1 分数实测落在 0.296–0.660（中位 0.497），且全局兜底通道在每一档阈值上
+# 都提升召回——阈值从 0.30 提到 0.70，三个独立评测集上的变化是
+# 段落查询(n=120) Hit@5 57%→88%、首句查询(n=71) 44%→69%、手写查询(n=32) MRR 0.678→0.932。
+# 也就是说这个阈值的最优解是「兜底常开」：路由一次取 3 篇、其中往往 2 篇是错的，
+# 少了全局通道，正确切片在 RRF 里会被错误文档的并列第一压掉。
+# 0.70 取在实测最大值之上，等价于兜底常开；换语料或换 embedding 后重跑校准脚本再调。
+_MIN_ROUTE_SCORE = 0.70
 
 
 def two_stage_search(

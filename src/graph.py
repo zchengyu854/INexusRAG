@@ -28,7 +28,12 @@ from src.storage.database import (
 )
 
 ANCHOR_TOP = 5            # 查询侧取几个实体锚点
-MIN_ANCHOR_SCORE = 0.5   # 锚点余弦阈值  # ponytail: 未校准，观测到漏检后调
+# 校准（2026-09-11，同 scripts/calibrate_thresholds.py）：候选锚点分数实测 0.351–0.838（中位 0.492）。
+# 阈值越低，锚点越多但越脏——0.50 时锚点来源文档准确率仅 75%，图通道会把别的文档的切片
+# 掺进来，实测把 Hit@5 从 94% 拖到 81%（等于开着图通道反而变差）；
+# 0.60 时锚点准确率 100%、图通道与「不开图通道」持平，只是覆盖率降到 25%。
+# 结论：宁可少锚、不要脏锚。换语料/换 embedding 后重跑校准脚本再调。
+MIN_ANCHOR_SCORE = 0.60
 MERGE_SCORE = 0.92       # 实体 ANN 合并阈值  # ponytail: 未校准
 HOPS = 2
 
