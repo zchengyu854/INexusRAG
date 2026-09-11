@@ -83,7 +83,10 @@ class PlanTests(unittest.TestCase):
             multi_query_search("原始问题", top_k=2, features=[])
             plan.assert_not_called()  # 规划类特性全关 → 不付 LLM 调用
             self.assertEqual(len(tss.call_args_list), 1)
-            self.assertEqual(tss.call_args_list[0].kwargs, {"top_k": 2, "terms": [], "filters": None, "use_routing": False})
+            self.assertEqual(
+                tss.call_args_list[0].kwargs,
+                {"top_k": 2, "terms": [], "filters": None, "use_routing": False, "stats": None},
+            )
 
     def test_multi_query_search_features_keywords_only_disables_routing(self):
         with patch("src.retrieval.two_stage_search", return_value=[row("a")]) as tss, \
@@ -176,7 +179,9 @@ class RetrievalTests(unittest.TestCase):
         self.assertLess(len(summary), 320)
 
     def test_multi_query_search_merges_subquestion_channels(self):
-        def fake_tss(vec, top_k, terms, filters=None, use_routing=True):
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
+            if stats is not None:
+                stats["channels"].append({"channel": "vector", "count": top_k})
             return [{"chunk_id": f"c-{i}", "text": f"{terms}-{i}"} for i in range(top_k)]
 
         plan = {"subs": ["子问题 A", "子问题 B"], "step_back": None, "hyde": None}
