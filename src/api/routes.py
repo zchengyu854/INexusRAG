@@ -422,7 +422,17 @@ def query(request: QueryRequest):
                 figures.extend(extract_page_images(src, page_list))
         except Exception:  # 取图失败不影响主回答
             pass
-    answer = get_llm().generate(request.question, results, history=history)
+    generation_error: str | None = None
+    try:
+        answer = get_llm().generate(request.question, results, history=history)
+    except Exception as exc:
+        # 检索已经拿到结果，不应因为 LLM 不可用（key 失效/限流/超时）把整轮问答打成 500：
+        # 降级为提示文案 + 保留命中来源，用户仍能看到检索到了什么。
+        generation_error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        answer = (
+            "检索已完成，但生成回答时调用大模型失败，下面仅列出命中的原文片段。\n\n"
+            f"错误：{generation_error}"
+        )
     t_generated = time.perf_counter()
     source_data = [source.model_dump() for source in sources]
     save_message(conversation_id, "assistant", answer, source_data)

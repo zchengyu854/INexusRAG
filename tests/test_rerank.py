@@ -32,6 +32,29 @@ class RerankTests(unittest.TestCase):
         # c-2 得 9 分排第一；c-1 无打分回落 rrf score
         self.assertEqual(out[0]["chunk_id"], "c-2")
 
+    def test_llm_strategy_without_llm_falls_back_to_rrf_order(self):
+        """未配置 LLM 时 llm 策略必须退回 RRF 序，不能因参数个数错误抛 TypeError。"""
+        class _DisabledLLM:
+            enabled = False
+        with patch.dict("os.environ", {"RERANK_STRATEGY": "llm"}), \
+             patch("src.llm.client.get_llm", return_value=_DisabledLLM()):
+            out = rerank("q", [cand(0), cand(1), cand(2)], 3)
+        self.assertEqual([r["chunk_id"] for r in out], ["c-2", "c-1", "c-0"])
+
+    def test_llm_strategy_survives_candidates_without_chunk_id(self):
+        class _LLM:
+            enabled = True
+            def tool_call(self, prompt: str, tool: dict) -> dict:
+                return {"scores": {"c1": 8}}
+        rows = [
+            {"text": "a", "score": 0.1},
+            {"text": "b", "score": 0.2},
+        ]
+        with patch.dict("os.environ", {"RERANK_STRATEGY": "llm"}), \
+             patch("src.llm.client.get_llm", return_value=_LLM()):
+            out = rerank("q", rows, 2)
+        self.assertEqual(out[0]["text"], "b")  # 缺 chunk_id 时用序号键，不打乱也不报错
+
     def test_unknown_strategy_raises(self):
         with patch.dict("os.environ", {"RERANK_STRATEGY": "xgboost"}):
             with self.assertRaises(ValueError):

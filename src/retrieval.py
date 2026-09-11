@@ -255,11 +255,18 @@ def multi_query_search(
     fused_count = len(merged) if debug else 0
     rerank_used = False
     effective_strategy: str | None = None
+    rerank_error: str | None = None
     if "rerank" in requested and merged:
         from src.rerank import rerank
         effective_strategy = (rerank_strategy or os.getenv("RERANK_STRATEGY", "rrf")).lower()
-        merged = rerank(question, merged, top_k, strategy=effective_strategy)
-        rerank_used = True
+        try:
+            merged = rerank(question, merged, top_k, strategy=effective_strategy)
+            rerank_used = True
+        except Exception as exc:
+            # ponytail: cross/colbert 依赖本地模型，未下载时不能让整个问答 500，
+            # 这里退回 RRF 序并在 trace 里记 reason（界面上表现为"请求了但空转"）。
+            rerank_error = f"{type(exc).__name__}: {exc}"
+            merged = merged[:top_k]  # 融合时为重排预留了 top_k*5 候选，降级后要收回
 
     if not debug:
         return merged
@@ -309,6 +316,8 @@ def multi_query_search(
     if "rerank" in requested:
         if rerank_used:
             applied.append("rerank")
+        elif rerank_error:
+            skipped.append({"name": "rerank", "reason": f"重排失败已退回 RRF 序（{rerank_error}）"})
         else:
             skipped.append({"name": "rerank", "reason": "候选为空，未执行重排"})
 

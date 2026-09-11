@@ -211,6 +211,26 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(len(tss_mock.call_args_list), 4)
         self.assertEqual(tss_mock.call_args_list[3].kwargs["terms"], [])
 
+    def test_rerank_failure_degrades_to_rrf_and_is_reported_as_skipped(self):
+        """cross/colbert 依赖本地模型，缺失时不能让问答整体 500，且 trace 要说明原因。"""
+        plan = {"subs": [], "step_back": None, "hyde": None}
+
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
+            return [row("a", 0.9), row("b", 0.8)]
+
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge, \
+             patch("src.rerank.rerank", side_effect=RuntimeError("cross-encoder 未下载")):
+            ge.return_value.encode.return_value = [[0.0]]
+            out = multi_query_search("问题", top_k=1, features=["rerank"], debug=True)
+
+        trace = out["trace"]
+        self.assertNotIn("rerank", trace["applied"])
+        reason = next(s["reason"] for s in trace["skipped"] if s["name"] == "rerank")
+        self.assertIn("退回", reason)
+        self.assertEqual([r["chunk_id"] for r in out["results"]], ["a"])
+
     def test_multi_query_search_empty_plan_is_single_channel(self):
         with patch("src.retrieval.two_stage_search", return_value=[]) as tss_mock, \
              patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \

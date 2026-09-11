@@ -52,12 +52,15 @@ def _score_llm(query: str, candidates: list[dict]) -> list[float]:
 
     llm = get_llm()
     if not llm.enabled:
-        return _score_rrf(candidates)
-    listing = "\n".join(f"{c['chunk_id']}: {c['text'][:200]}" for c in candidates)
+        return _score_rrf(query, candidates)
+    keys = [str(c.get("chunk_id") or f"c{index}") for index, c in enumerate(candidates)]
+    listing = "\n".join(
+        f"{key}: {(c.get('text') or '')[:200]}" for key, c in zip(keys, candidates)
+    )
     try:
         data = llm.tool_call(f"问题：{query}\n片段：\n{listing}", _SCORE_TOOL)
-        data = data.get("scores", {})
-        return [float(data.get(c["chunk_id"], c.get("score", 0.0))) for c in candidates]
+        data = data.get("scores", {}) if isinstance(data, dict) else {}
+        return [float(data.get(key, c.get("score", 0.0))) for key, c in zip(keys, candidates)]
     except Exception:
         return _score_rrf(query, candidates)
 
