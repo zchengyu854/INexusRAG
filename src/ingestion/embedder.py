@@ -42,7 +42,13 @@ class Embedder:
         self.provider = provider or _get_env("EMBEDDING_PROVIDER", "openai").lower()
         self.api_key = _get_env("EMBEDDING_API_KEY", "")
         self.base_url = _get_env("EMBEDDING_BASE_URL", "https://api.openai.com/v1")
-        self.model = _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
+        # provider=local 时 EMBEDDING_MODEL 通常是没设的，不能回退成 OpenAI 的默认模型名，
+        # 否则日志/报错里会显示 text-embedding-3-small 而实际跑的是 BAAI/bge-m3。
+        self.model = (
+            _get_env("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3")
+            if self.provider == "local"
+            else _get_env("EMBEDDING_MODEL", "text-embedding-3-small")
+        )
         self.dimension = embedding_dimension()
 
         if self.provider == "openai":
