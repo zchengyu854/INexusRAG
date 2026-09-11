@@ -126,6 +126,37 @@ class LLMClient:
 
         return _json.loads(tool_calls[0].function.arguments or "{}")
 
+    def chat_with_tools(self, messages: list[dict], tools: list[dict], temperature: float = 0) -> dict:
+        """多工具 ReAct：让模型在 tools 中自主选择一个（或不选）。
+
+        与 tool_call 的区别：tool_call 用 tool_choice 强制调用某一个工具（结构化输出），
+        本方法不强制，模型可以选任意工具、也可以不调用——「不调用」即视为 Agent 决定收敛。
+
+        返回 {"thought": str, "tool": str, "args": dict}；未调用任何工具时 tool="answer"。
+        """
+        response = self._get_client().chat.completions.create(
+            model=self.model,
+            temperature=temperature,
+            messages=messages,
+            tools=tools,
+        )
+        message = response.choices[0].message
+        calls = list(message.tool_calls or ())
+        thought = (message.content or "").strip()
+        if not calls:
+            return {"thought": thought, "tool": "answer", "args": {}}
+        # ReAct 每步只执行一个动作；多返回时取第一个，避免一次跑爆预算
+        function = calls[0].function
+        import json as _json
+
+        try:
+            args = _json.loads(function.arguments or "{}")
+        except ValueError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return {"thought": thought, "tool": function.name or "answer", "args": args}
+
 
 def get_llm() -> LLMClient:
     """每次重新解析：优先使用数据库中标记为 active 的 provider，否则回退环境变量。"""

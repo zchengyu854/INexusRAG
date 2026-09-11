@@ -32,6 +32,7 @@ from src.api.schemas import (
     HealthEmbedding,
     HealthLLM,
     HealthStatusResponse,
+    AgentTrace,
     QueryRequest,
     QueryResponse,
     QueryTrace,
@@ -354,6 +355,22 @@ async def clear_conversation(conversation_id: str):
     return {"ok": True}
 
 
+def _run_agent_or_none(request: QueryRequest) -> dict | None:
+    """Agentic 检索；任何异常都静默返回 None，由调用方退回单轮管线（绝不整体失败）。"""
+    try:
+        from src.agent import run_agent
+
+        return run_agent(
+            request.question,
+            top_k=request.top_k,
+            filters=request.filters,
+            max_steps=request.max_steps,
+            features=request.features,
+        )
+    except Exception:  # agentic 只是锦上添花，出错必须能安静退回已验证的单轮管线
+        return None
+
+
 @router.post("/query", response_model=QueryResponse)
 def query(request: QueryRequest):
     t0 = time.perf_counter()
@@ -371,18 +388,29 @@ def query(request: QueryRequest):
             conversation_id=conversation_id,
         )
 
-    results = multi_query_search(
-        request.question,
-        top_k=request.top_k,
-        filters=request.filters,
-        features=request.features,
-        rerank_strategy=request.rerank_strategy,
-        debug=request.debug,
-    )
+    results: list[dict] = []
     trace_data: dict | None = None
-    if request.debug and isinstance(results, dict):
-        trace_data = results["trace"]
-        results = results["results"]
+    agent_trace: dict | None = None
+
+    if request.mode == "agent":
+        outcome = _run_agent_or_none(request)
+        if outcome is not None:
+            results, agent_trace = outcome["results"], outcome["trace"]
+
+    if not results:  # pipeline 模式，或 agent 未产出（静默降级）
+        raw = multi_query_search(
+            request.question,
+            top_k=request.top_k,
+            filters=request.filters,
+            features=request.features,
+            rerank_strategy=request.rerank_strategy,
+            debug=request.debug,
+        )
+        if request.debug and isinstance(raw, dict):
+            trace_data = raw["trace"]
+            results = raw["results"]
+        else:
+            results = raw
     t_retrieved = time.perf_counter()
     if not results:
         answer = "未检索到相关内容，请先上传并入库文档。"
@@ -439,9 +467,15 @@ def query(request: QueryRequest):
     latency_ms = round((time.perf_counter() - t0) * 1000, 1)
 
     trace = None
-    if trace_data is not None:
-        trace_data["timings"]["generate_ms"] = round((t_generated - t_retrieved) * 1000, 1)
+    if request.debug:
+        if trace_data is None:
+            trace_data = {}
+        trace_data.setdefault("timings", {})["generate_ms"] = round(
+            (t_generated - t_retrieved) * 1000, 1
+        )
         trace = QueryTrace(**trace_data)
+        if agent_trace is not None:
+            trace.agent = AgentTrace(**agent_trace)
 
     return QueryResponse(
         answer=answer,

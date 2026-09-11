@@ -10,6 +10,10 @@ FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "r
 # 重排策略；None（不传）= 用环境变量 RERANK_STRATEGY，默认 rrf
 RerankStrategy = Literal["rrf", "cross", "llm", "colbert"]
 
+# 检索范式。pipeline = 现有单轮多通道管线；agent = Agentic 自主多轮循环。
+# Agentic 是编排层而非检索通道，故用顶层 mode 而非塞进 features。
+QueryMode = Literal["pipeline", "agent"]
+
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
@@ -20,6 +24,10 @@ class QueryRequest(BaseModel):
     features: list[FeatureName] | None = Field(None, max_length=7)
     # 请求级重排策略覆盖；None 时回退环境变量
     rerank_strategy: RerankStrategy | None = None
+    # 检索范式；默认 pipeline，行为与接入 Agentic 前完全一致
+    mode: QueryMode = "pipeline"
+    # agent 模式下的最大步数（仅 agent 生效）
+    max_steps: int = Field(6, ge=1, le=12)
     # 请求检索 trace（检视面板用）。默认关闭，关闭时检索路径零额外开销
     debug: bool = False
 
@@ -107,6 +115,29 @@ class TraceTimings(BaseModel):
     generate_ms: float = 0.0
 
 
+class AgentStep(BaseModel):
+    """Agent 循环中的一步：Thought → 工具(参数) → 观测。"""
+
+    step: int
+    thought: str | None = None  # 模型的推理文本，模型未输出则为 None
+    tool: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    observation: str | None = None  # 本步观测摘要（回灌给下一步 + 前端展示）
+    new_chunks: int = 0  # 本步新增证据数（判断边际收益）
+    error: str | None = None
+    latency_ms: float = 0.0
+
+
+class AgentTrace(BaseModel):
+    """Agentic 循环的过程快照，仅 mode=agent 且成功时返回。"""
+
+    steps: list[AgentStep] = Field(default_factory=list)
+    termination: str | None = None  # answered | budget | max_steps | stagnant | error
+    budget: dict[str, Any] = Field(default_factory=dict)
+    evidence_chunks: int = 0
+    tools: list[str] = Field(default_factory=list)
+
+
 class QueryTrace(BaseModel):
     """检索过程快照，仅在 debug=true 时返回。"""
 
@@ -119,6 +150,7 @@ class QueryTrace(BaseModel):
     channels: list[TraceChannel] = Field(default_factory=list)
     fusion: TraceFusion = Field(default_factory=TraceFusion)
     timings: TraceTimings = Field(default_factory=TraceTimings)
+    agent: "AgentTrace | None" = None  # 仅 mode=agent 且未降级时非空
 
 
 class QueryResponse(BaseModel):
