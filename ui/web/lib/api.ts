@@ -22,6 +22,14 @@ export interface Doc {
   filename: string
   chunks: number
   status: string
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+/** 原件预览地址：PDF 可拼接 #page=N 直接定位到页。 */
+export function documentFileUrl(docId: string, page?: number | null): string {
+  const base = `${API_BASE}/documents/${encodeURIComponent(docId)}/file`
+  return page ? `${base}#page=${page}` : base
 }
 
 export interface Chunk {
@@ -90,6 +98,148 @@ export interface LLMProvider {
 
 export type LLMProviderDraft = Omit<LLMProvider, "id" | "created_at">
 
+// ---- 检索 trace（仅 debug=true 时后端返回）----
+
+export interface TraceChannel {
+  name: string
+  label: string
+  hits: number
+}
+
+export interface TracePlan {
+  subs: string[]
+  step_back: string | null
+  hyde: string | null
+  queries: string[]
+}
+
+export interface TraceFusion {
+  channels: number
+  pre_merge: number
+  post_merge: number
+  rerank: string | null
+  final: number
+}
+
+export interface TraceTimings {
+  plan_ms: number
+  retrieve_ms: number
+  generate_ms: number
+}
+
+export interface QueryTrace {
+  features: string[]
+  active: string[]
+  plan: TracePlan
+  channels: TraceChannel[]
+  fusion: TraceFusion
+  timings: TraceTimings
+}
+
+// ---- 健康状态 ----
+
+export interface HealthStatus {
+  status: "ok" | "degraded"
+  version: string
+  database: { ok: boolean; latency_ms?: number | null; error?: string | null }
+  llm: { configured: boolean; source: "database" | "env" | "none"; name?: string | null; model?: string | null }
+  embedding: { provider: string; model: string; dimension: number }
+  documents: number
+  chunks: number
+}
+
+// ---- 图谱 ----
+
+export interface GraphStats {
+  entities: number
+  relations: number
+  links: number
+  orphan_entities: number
+  kinds: Record<string, number>
+}
+
+export interface GraphEntity {
+  entity_id: string
+  name: string
+  norm: string
+  kind: string
+  description: string
+  mentions: number
+}
+
+export interface GraphEdge {
+  rel: string
+  norm_rel: string
+  weight: number
+  entity_id: string
+  name: string
+  kind: string
+  evidence_chunk_id?: string | null
+}
+
+export interface GraphChunkRef {
+  chunk_id: string
+  document_id: string
+  doc_name: string
+  chunk_index: number
+  text: string
+  page?: number | null
+}
+
+export interface GraphEntityDetail {
+  entity: GraphEntity
+  out_edges: GraphEdge[]
+  in_edges: GraphEdge[]
+  evidence: GraphChunkRef[]
+}
+
+export interface GraphNode {
+  entity_id: string
+  name: string
+  kind: string
+  mentions: number
+  hop: number
+}
+
+export interface GraphLink {
+  src: string
+  dst: string
+  rel: string
+  norm_rel: string
+  weight: number
+}
+
+export interface GraphSubgraph {
+  nodes: GraphNode[]
+  edges: GraphLink[]
+}
+
+// ---- 评测 ----
+
+export interface EvalCase {
+  id: number
+  question: string
+  expected_refs: string
+  reference_answer?: string | null
+}
+
+export interface EvalRow {
+  label: string
+  hit_at_k: number
+  mrr: number
+}
+
+export interface EvalRunResult {
+  k: number
+  case_count: number
+  rows: EvalRow[]
+}
+
+export interface EvalConfigInput {
+  label: string
+  features: string[] | null
+}
+
 export async function fetchDocs(): Promise<Doc[]> {
   const res = await fetch(`${API_BASE}/documents`)
   if (!res.ok) throw new Error("Failed to fetch documents")
@@ -156,19 +306,36 @@ export async function getConversations(): Promise<ConversationSummary[]> {
   return res.json()
 }
 
+export interface QueryResult {
+  answer: string
+  sources: Source[]
+  figures: Figure[]
+  conversation_id: string
+  latency_ms: number
+  trace?: QueryTrace | null
+}
+
 export async function queryDoc(
   question: string,
   conversationId: string,
   topK = 5,
   filters?: Record<string, string | number | boolean>,
-  features?: string[]
-): Promise<{ answer: string; sources: Source[]; figures: Figure[]; conversation_id: string; latency_ms: number }> {
+  features?: string[],
+  debug = false
+): Promise<QueryResult> {
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, conversation_id: conversationId, top_k: topK, ...(filters ? { filters } : {}), ...(features ? { features } : {}) }),
+    body: JSON.stringify({
+      question,
+      conversation_id: conversationId,
+      top_k: topK,
+      ...(filters ? { filters } : {}),
+      ...(features ? { features } : {}),
+      ...(debug ? { debug: true } : {}),
+    }),
   })
-  if (!res.ok) throw new Error("Query failed")
+  if (!res.ok) throw new Error(`问答请求失败（HTTP ${res.status}）`)
   return res.json()
 }
 
@@ -225,5 +392,91 @@ export async function activateProvider(id: string): Promise<void> {
 export async function testProvider(id: string): Promise<{ ok: boolean; detail: string }> {
   const res = await fetch(`${API_BASE}/llm/providers/${encodeURIComponent(id)}/test`, { method: "POST" })
   if (!res.ok) throw new Error("Test provider failed")
+  return res.json()
+}
+
+// ---- 健康检查 ----
+
+export async function getHealth(): Promise<HealthStatus> {
+  const res = await fetch(`${API_BASE}/health`, { cache: "no-store" })
+  if (!res.ok) throw new Error(`健康检查失败（HTTP ${res.status}）`)
+  return res.json()
+}
+
+// ---- 图谱 ----
+
+export async function getGraphStats(): Promise<GraphStats> {
+  const res = await fetch(`${API_BASE}/graph/stats`, { cache: "no-store" })
+  if (!res.ok) throw new Error("获取图谱统计失败")
+  return res.json()
+}
+
+export async function searchGraphEntities(q: string, kind?: string, limit = 20): Promise<GraphEntity[]> {
+  const params = new URLSearchParams()
+  if (q.trim()) params.set("q", q.trim())
+  if (kind) params.set("kind", kind)
+  params.set("limit", String(limit))
+  const res = await fetch(`${API_BASE}/graph/search?${params.toString()}`)
+  if (!res.ok) throw new Error("搜索实体失败")
+  return res.json()
+}
+
+export async function getGraphEntity(entityId: string): Promise<GraphEntityDetail> {
+  const res = await fetch(`${API_BASE}/graph/entities/${encodeURIComponent(entityId)}`)
+  if (!res.ok) throw new Error("获取实体详情失败")
+  return res.json()
+}
+
+export async function getSubgraph(entityId: string, hops = 2, limit = 150): Promise<GraphSubgraph> {
+  const params = new URLSearchParams({ entity_id: entityId, hops: String(hops), limit: String(limit) })
+  const res = await fetch(`${API_BASE}/graph/subgraph?${params.toString()}`)
+  if (!res.ok) throw new Error("获取子图失败")
+  return res.json()
+}
+
+// ---- 评测 ----
+
+export async function getEvalCases(): Promise<EvalCase[]> {
+  const res = await fetch(`${API_BASE}/eval/cases`, { cache: "no-store" })
+  if (!res.ok) throw new Error("获取评测集失败")
+  return res.json()
+}
+
+export async function addEvalCase(payload: {
+  question: string
+  expected_refs: string
+  reference_answer?: string | null
+}): Promise<EvalCase> {
+  const res = await fetch(`${API_BASE}/eval/cases`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) throw new Error("新增评测例失败")
+  return res.json()
+}
+
+export async function seedEvalCases(): Promise<{ added: number }> {
+  const res = await fetch(`${API_BASE}/eval/seed`, { method: "POST" })
+  if (!res.ok) throw new Error("播种评测例失败")
+  return res.json()
+}
+
+export async function runEval(k: number, configs?: EvalConfigInput[]): Promise<EvalRunResult> {
+  const res = await fetch(`${API_BASE}/eval/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ k, ...(configs && configs.length ? { configs } : {}) }),
+  })
+  if (!res.ok) {
+    let detail = `运行评测失败（HTTP ${res.status}）`
+    try {
+      const body = await res.json()
+      if (body?.detail) detail = String(body.detail)
+    } catch {
+      // 响应体不是 JSON 时保留默认提示
+    }
+    throw new Error(detail)
+  }
   return res.json()
 }

@@ -41,11 +41,20 @@ def add_case(question: str, expected_refs: str, reference_answer: str | None = N
 
 
 def load_cases() -> list[dict]:
+    """评测例列表。expected 为 'doc_name:chunk_index' 集合，expected_refs 保留原始串供 API 回显。"""
     ensure_table()
     with connection() as conn:
-        rows = list(conn.execute("SELECT id, question, expected_refs FROM eval_cases ORDER BY id"))
+        rows = list(conn.execute(
+            "SELECT id, question, expected_refs, reference_answer FROM eval_cases ORDER BY id"
+        ))
     return [
-        {"id": r["id"], "question": r["question"], "expected": set(filter(None, r["expected_refs"].split("|")))}
+        {
+            "id": r["id"],
+            "question": r["question"],
+            "expected_refs": r["expected_refs"] or "",
+            "reference_answer": r["reference_answer"],
+            "expected": set(filter(None, (r["expected_refs"] or "").split("|"))),
+        }
         for r in rows
     ]
 

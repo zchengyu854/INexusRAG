@@ -47,6 +47,7 @@ ui/node_modules/
 .pi/
 .agents/
 .claude/
+.workbuddy/
 skills-lock.json
 
 # Coverage

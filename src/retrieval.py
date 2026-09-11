@@ -150,13 +150,27 @@ ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rerank"
 _DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")  # rerank/graph 默认关，消融时显式传 features
 
 
-def multi_query_search(question: str, top_k: int, filters: dict | None = None, features: list[str] | None = None) -> list[dict]:
-    """多查询：features 控制通道开关（None = 默认全开除 rerank）→ 两级检索 → RRF → 可选 rerank。"""
+def multi_query_search(
+    question: str,
+    top_k: int,
+    filters: dict | None = None,
+    features: list[str] | None = None,
+    debug: bool = False,
+) -> list[dict] | dict:
+    """多查询：features 控制通道开关（None = 默认全开除 rerank）→ 两级检索 → RRF → 可选 rerank。
+
+    debug=True 时返回 {"results": [...], "trace": {...}}，只为把过程暴露给检视面板，
+    不重复跑一遍检索。debug=False（默认）时不构造任何 trace 结构，路径与改动前一致。
+    """
+    import time as _time
+
     from src.ingestion.embedder import get_embedder
 
+    t_start = _time.perf_counter() if debug else 0.0
     active = set(_DEFAULT_FEATURES) if features is None else set(features)
     # 只有启用规划类特性才付 LLM 规划调用
     plan = plan_question(question) if {"decompose", "stepback", "hyde"} & active else {"subs": [], "step_back": None, "hyde": None}
+    t_planned = _time.perf_counter() if debug else 0.0
     queries = [question]
     if "decompose" in active:
         queries += [s for s in plan["subs"] if s != question]
@@ -164,21 +178,74 @@ def multi_query_search(question: str, top_k: int, filters: dict | None = None, f
         queries.append(plan["step_back"])
     vectors = get_embedder().encode(queries)
     use_routing = "routing" in active
-    channels = [
-        two_stage_search(vec, top_k=top_k,
-                         terms=(extract_terms(q) if "keywords" in active else []),
-                         filters=filters, use_routing=use_routing)
-        for q, vec in zip(queries, vectors)
-    ]
+
+    def _search(query: str, vector: list[float]) -> list[dict]:
+        return two_stage_search(
+            vector, top_k=top_k,
+            terms=(extract_terms(query) if "keywords" in active else []),
+            filters=filters, use_routing=use_routing,
+        )
+
+    channels: list[list[dict]] = []
+    primary = _search(queries[0], vectors[0])
+    channels.append(primary)
+    expanded = [_search(q, vec) for q, vec in zip(queries[1:], vectors[1:])]
+    channels.extend(expanded)
+    hyde_rows: list[dict] = []
     if "hyde" in active and plan["hyde"]:
         hyde_vec = get_embedder().encode([plan["hyde"]])[0]
-        channels.append(two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing))
+        hyde_rows = two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing)
+        channels.append(hyde_rows)
+    graph_rows: list[dict] = []
     if "graph" in active:
         # 图谱通道：复用原问题的向量做实体锚点，零额外 embedding 成本
         from src.graph import graph_channel
-        channels.append(graph_channel(vectors[0], top_k=max(top_k * 5, 25), filters=filters))
+        graph_rows = graph_channel(vectors[0], top_k=max(top_k * 5, 25), filters=filters)
+        channels.append(graph_rows)
+    t_retrieved = _time.perf_counter() if debug else 0.0
+
     merged = rrf_merge(channels, top_k if "rerank" not in active else top_k * 5)
+    fused_count = len(merged) if debug else 0
+    strategy = None
     if "rerank" in active and merged:
         from src.rerank import rerank
+        import os as _os
+        strategy = _os.getenv("RERANK_STRATEGY", "rrf").lower()
         merged = rerank(question, merged, top_k)
-    return merged
+
+    if not debug:
+        return merged
+
+    trace_channels = [{"name": "primary", "label": "主查询", "hits": len(primary)}]
+    if expanded:
+        trace_channels.append({"name": "expanded", "label": "扩展查询", "hits": sum(len(rows) for rows in expanded)})
+    if "hyde" in active and plan["hyde"]:
+        trace_channels.append({"name": "hyde", "label": "假想文档", "hits": len(hyde_rows)})
+    if "graph" in active:
+        trace_channels.append({"name": "graph", "label": "图谱", "hits": len(graph_rows)})
+    return {
+        "results": merged,
+        "trace": {
+            "features": sorted(active),
+            "active": sorted(active),
+            "plan": {
+                "subs": list(plan["subs"]),
+                "step_back": plan["step_back"],
+                "hyde": plan["hyde"],
+                "queries": list(queries),
+            },
+            "channels": trace_channels,
+            "fusion": {
+                "channels": len(channels),
+                "pre_merge": len({row["chunk_id"] for channel in channels for row in channel}),
+                "post_merge": fused_count,
+                "rerank": strategy,
+                "final": len(merged),
+            },
+            "timings": {
+                "plan_ms": round((t_planned - t_start) * 1000, 1),
+                "retrieve_ms": round((t_retrieved - t_planned) * 1000, 1),
+                "generate_ms": 0.0,
+            },
+        },
+    }

@@ -499,6 +499,147 @@ def graph_stats() -> dict:
     return dict(row)
 
 
+def graph_kind_counts() -> dict:
+    """实体类型分布，供图谱页筛选器使用。"""
+    with connection() as conn:
+        rows = list(conn.execute(
+            "SELECT kind, count(*)::int AS count FROM entities GROUP BY kind ORDER BY count DESC"
+        ))
+    return {row["kind"]: row["count"] for row in rows}
+
+
+def search_entities_by_text(query: str, kind: str | None = None, limit: int = 20) -> list[dict]:
+    """按名称/描述子串检索实体（浏览用，非检索锚点），按提及次数排序。"""
+    where: list[str] = []
+    params: list[object] = []
+    text = (query or "").strip()
+    if text:
+        where.append("(name ILIKE %s OR norm ILIKE %s OR description ILIKE %s)")
+        pattern = f"%{text}%"
+        params.extend([pattern, pattern, pattern])
+    if kind:
+        where.append("kind = %s")
+        params.append(kind)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connection() as conn:
+        return list(conn.execute(
+            f"""
+            SELECT id::text AS entity_id, name, norm, kind, description, mentions
+            FROM entities
+            {clause}
+            ORDER BY mentions DESC, name ASC
+            LIMIT %s
+            """,
+            [*params, limit],
+        ))
+
+
+def get_entity(entity_id: str) -> dict | None:
+    """单个实体详情。"""
+    with connection() as conn:
+        return conn.execute(
+            """
+            SELECT id::text AS entity_id, name, norm, kind, description, mentions
+            FROM entities WHERE id = %s
+            """,
+            (entity_id,),
+        ).fetchone()
+
+
+def entity_edges(entity_id: str, limit: int = 50) -> dict:
+    """实体的出边与入边（含对端实体信息），按 weight 降序。"""
+    with connection() as conn:
+        outgoing = list(conn.execute(
+            """
+            SELECT r.rel, r.norm_rel, r.weight, r.evidence::text AS evidence_chunk_id,
+                   e.id::text AS entity_id, e.name, e.kind
+            FROM relations r
+            JOIN entities e ON e.id = r.dst
+            WHERE r.src = %s
+            ORDER BY r.weight DESC, e.name ASC
+            LIMIT %s
+            """,
+            (entity_id, limit),
+        ))
+        incoming = list(conn.execute(
+            """
+            SELECT r.rel, r.norm_rel, r.weight, r.evidence::text AS evidence_chunk_id,
+                   e.id::text AS entity_id, e.name, e.kind
+            FROM relations r
+            JOIN entities e ON e.id = r.src
+            WHERE r.dst = %s
+            ORDER BY r.weight DESC, e.name ASC
+            LIMIT %s
+            """,
+            (entity_id, limit),
+        ))
+    return {"out": outgoing, "in": incoming}
+
+
+def entity_evidence_chunks(entity_id: str, limit: int = 10) -> list[dict]:
+    """该实体被提及的切片（图谱召回最终落回的证据）。"""
+    with connection() as conn:
+        return list(conn.execute(
+            """
+            SELECT c.id::text AS chunk_id, c.document_id, c.doc_name, c.chunk_index,
+                   c.text, c.metadata
+            FROM chunk_entities ce
+            JOIN chunks c ON c.id = ce.chunk_id
+            WHERE ce.entity_id = %s
+            ORDER BY c.doc_name, c.chunk_index
+            LIMIT %s
+            """,
+            (entity_id, limit),
+        ))
+
+
+def graph_subgraph(anchor_ids: list[str], hops: int = 2, limit: int = 150) -> dict:
+    """以锚点实体为起点扩展 ≤hops 跳，返回 {nodes, edges} 图结构。
+
+    与 graph_chunks 同源（都用 relations 双向扩展 + path 防环），区别是这里返回图本身
+    而不是落回切片。hop 取多锚点命中时的最小跳数。
+    """
+    if not anchor_ids:
+        return {"nodes": [], "edges": []}
+    with connection() as conn:
+        nodes = list(conn.execute(
+            """
+            WITH RECURSIVE reach(entity_id, hop, path) AS (
+                SELECT a, 0, ARRAY[a] FROM unnest(%s::uuid[]) AS a
+                UNION ALL
+                SELECT nb.entity_id, reach.hop + 1, reach.path || nb.entity_id
+                FROM reach
+                JOIN LATERAL (
+                    SELECT CASE WHEN r.src = reach.entity_id THEN r.dst ELSE r.src END AS entity_id
+                    FROM relations r
+                    WHERE r.src = reach.entity_id OR r.dst = reach.entity_id
+                ) AS nb ON NOT (nb.entity_id = ANY(reach.path))
+                WHERE reach.hop < %s
+            )
+            SELECT e.id::text AS entity_id, e.name, e.kind, e.mentions, min(reach.hop) AS hop
+            FROM reach
+            JOIN entities e ON e.id = reach.entity_id
+            GROUP BY e.id, e.name, e.kind, e.mentions
+            ORDER BY hop ASC, e.mentions DESC
+            LIMIT %s
+            """,
+            (anchor_ids, hops, limit),
+        ))
+        if not nodes:
+            return {"nodes": [], "edges": []}
+        node_ids = [row["entity_id"] for row in nodes]
+        edges = list(conn.execute(
+            """
+            SELECT r.src::text AS src, r.dst::text AS dst, r.rel, r.norm_rel, r.weight
+            FROM relations r
+            WHERE r.src = ANY(%s::uuid[]) AND r.dst = ANY(%s::uuid[])
+            ORDER BY r.weight DESC
+            """,
+            (node_ids, node_ids),
+        ))
+    return {"nodes": nodes, "edges": edges}
+
+
 def save_message(
     conversation_id: str,
     role: str,

@@ -1,4 +1,4 @@
-import type { Metadata } from "next"
+import type { Metadata, Viewport } from "next"
 import { Outfit, Geist_Mono } from "next/font/google"
 import "./globals.css"
 
@@ -14,14 +14,17 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "NexusRAG",
-  description: "Multi-document intelligent Q&A system",
+  description: "多文档智能问答系统",
+}
+
+export const viewport: Viewport = {
   themeColor: "#0d0f16",
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" className="dark">
-      <body className={`${outfit.variable} ${geistMono.variable} min-h-dvh overflow-x-hidden bg-background text-foreground`}>
+    <html lang="zh-CN" className="dark">
+      <body className={`${outfit.variable} ${geistMono.variable} min-h-dvh overflow-hidden bg-background text-foreground`}>
         {children}
       </body>
     </html>

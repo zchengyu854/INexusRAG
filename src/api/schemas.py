@@ -15,6 +15,8 @@ class QueryRequest(BaseModel):
     # 元数据过滤（JSONB 包含）：如 {"page": 5}、{"figure": true}；None 表示不过滤
     filters: dict[str, Any] | None = Field(None, max_length=8)
     features: list[FeatureName] | None = Field(None, max_length=7)
+    # 请求检索 trace（检视面板用）。默认关闭，关闭时检索路径零额外开销
+    debug: bool = False
 
 
 class Source(BaseModel):
@@ -40,12 +42,59 @@ class ConversationSummary(BaseModel):
     updated_at: str
 
 
+class TraceChannel(BaseModel):
+    """单条检索通道的贡献量。"""
+
+    name: str  # 机器名，如 routing / keywords / vector / hyde / graph
+    label: str  # 展示名
+    hits: int  # 该通道返回的块数
+
+
+class TracePlan(BaseModel):
+    """LLM 检索规划的输出。"""
+
+    subs: list[str] = Field(default_factory=list)
+    step_back: str | None = None
+    hyde: str | None = None
+    queries: list[str] = Field(default_factory=list)  # 实际参与检索的查询集合
+
+
+class TraceFusion(BaseModel):
+    """RRF 融合与重排的规模变化。"""
+
+    channels: int = 0
+    pre_merge: int = 0  # 融合前去重块数
+    post_merge: int = 0  # 融合后保留块数
+    rerank: str | None = None  # 重排策略，未启用为 None
+    final: int = 0
+
+
+class TraceTimings(BaseModel):
+    """耗时分解（毫秒）。"""
+
+    plan_ms: float = 0.0
+    retrieve_ms: float = 0.0
+    generate_ms: float = 0.0
+
+
+class QueryTrace(BaseModel):
+    """检索过程快照，仅在 debug=true 时返回。"""
+
+    features: list[str] = Field(default_factory=list)
+    active: list[str] = Field(default_factory=list)
+    plan: TracePlan = Field(default_factory=TracePlan)
+    channels: list[TraceChannel] = Field(default_factory=list)
+    fusion: TraceFusion = Field(default_factory=TraceFusion)
+    timings: TraceTimings = Field(default_factory=TraceTimings)
+
+
 class QueryResponse(BaseModel):
     answer: str
     sources: list[Source] = []
     figures: list["Figure"] = []  # 命中图片切片时按页提取的嵌入图（base64 data URI）
     latency_ms: float = 0.0
     conversation_id: str | None = None
+    trace: "QueryTrace | None" = None  # 仅 debug=true 时返回
 
 
 class Figure(BaseModel):
@@ -60,6 +109,8 @@ class DocInfo(BaseModel):
     filename: str
     chunks: int = 0
     status: str = "ready"  # pending | indexing | ready | failed
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 class DocConfig(BaseModel):
@@ -135,3 +186,140 @@ class LLMProviderOut(LLMProviderIn):
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "0.1.0"
+
+
+# ---- 健康检查：反映 DB / LLM / Embedding 的真实可用性 ----
+
+
+class HealthDatabase(BaseModel):
+    ok: bool
+    latency_ms: float | None = None
+    error: str | None = None
+
+
+class HealthLLM(BaseModel):
+    configured: bool
+    source: str  # database | env | none
+    name: str | None = None
+    model: str | None = None
+
+
+class HealthEmbedding(BaseModel):
+    provider: str
+    model: str
+    dimension: int
+
+
+class HealthStatusResponse(BaseModel):
+    status: str  # ok | degraded
+    version: str
+    database: HealthDatabase
+    llm: HealthLLM
+    embedding: HealthEmbedding
+    documents: int = 0
+    chunks: int = 0
+
+
+# ---- 图谱浏览 ----
+
+
+class GraphStats(BaseModel):
+    entities: int
+    relations: int
+    links: int
+    orphan_entities: int
+    kinds: dict[str, int] = Field(default_factory=dict)
+
+
+class GraphEntity(BaseModel):
+    entity_id: str
+    name: str
+    norm: str
+    kind: str
+    description: str
+    mentions: int
+
+
+class GraphEdge(BaseModel):
+    rel: str
+    norm_rel: str
+    weight: float
+    entity_id: str  # 对端实体
+    name: str
+    kind: str
+    evidence_chunk_id: str | None = None
+
+
+class GraphChunkRef(BaseModel):
+    chunk_id: str
+    document_id: str
+    doc_name: str
+    chunk_index: int
+    text: str
+    page: int | None = None
+
+
+class GraphEntityDetail(BaseModel):
+    entity: GraphEntity
+    out_edges: list[GraphEdge] = Field(default_factory=list)
+    in_edges: list[GraphEdge] = Field(default_factory=list)
+    evidence: list[GraphChunkRef] = Field(default_factory=list)
+
+
+class GraphNode(BaseModel):
+    entity_id: str
+    name: str
+    kind: str
+    mentions: int
+    hop: int
+
+
+class GraphLink(BaseModel):
+    src: str
+    dst: str
+    rel: str
+    norm_rel: str
+    weight: float
+
+
+class GraphSubgraph(BaseModel):
+    nodes: list[GraphNode] = Field(default_factory=list)
+    edges: list[GraphLink] = Field(default_factory=list)
+
+
+# ---- 评测 / 消融 ----
+
+
+class EvalCase(BaseModel):
+    id: int
+    question: str
+    expected_refs: str
+    reference_answer: str | None = None
+
+
+class EvalCaseIn(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    expected_refs: str = Field(..., min_length=1, max_length=2000)
+    reference_answer: str | None = Field(None, max_length=4000)
+
+
+class EvalConfigIn(BaseModel):
+    label: str = Field(..., min_length=1, max_length=64)
+    features: list[FeatureName] | None = None  # None = 默认特性集
+
+
+class EvalRunRequest(BaseModel):
+    k: int = Field(5, ge=1, le=20)
+    configs: list[EvalConfigIn] | None = Field(None, max_length=12)
+
+
+class EvalRow(BaseModel):
+    label: str
+    hit_at_k: float
+    mrr: float
+
+
+class EvalRunResult(BaseModel):
+    k: int
+    case_count: int
+    rows: list[EvalRow] = Field(default_factory=list)
