@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field, model_validator
 # 检索特性开关；None（不传）= 默认全开除 rerank，显式传 = 只开列出的
 FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "rerank", "graph"]
 
+# 重排策略；None（不传）= 用环境变量 RERANK_STRATEGY，默认 rrf
+RerankStrategy = Literal["rrf", "cross", "llm", "colbert"]
+
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
@@ -15,6 +18,8 @@ class QueryRequest(BaseModel):
     # 元数据过滤（JSONB 包含）：如 {"page": 5}、{"figure": true}；None 表示不过滤
     filters: dict[str, Any] | None = Field(None, max_length=8)
     features: list[FeatureName] | None = Field(None, max_length=7)
+    # 请求级重排策略覆盖；None 时回退环境变量
+    rerank_strategy: RerankStrategy | None = None
     # 请求检索 trace（检视面板用）。默认关闭，关闭时检索路径零额外开销
     debug: bool = False
 
@@ -47,7 +52,15 @@ class TraceChannel(BaseModel):
 
     name: str  # 机器名，如 routing / keywords / vector / hyde / graph
     label: str  # 展示名
-    hits: int  # 该通道返回的块数
+    hits: int  # 该通道返回的块数（routing 为命中的文档数）
+    detail: str | None = None  # 补充说明，如「已兜底全局」
+
+
+class TraceSkip(BaseModel):
+    """请求了但未真正生效的特性，附原因。"""
+
+    name: str
+    reason: str
 
 
 class TracePlan(BaseModel):
@@ -57,6 +70,23 @@ class TracePlan(BaseModel):
     step_back: str | None = None
     hyde: str | None = None
     queries: list[str] = Field(default_factory=list)  # 实际参与检索的查询集合
+
+
+class TraceRouting(BaseModel):
+    """路由层的判定细节。"""
+
+    routed_docs: int = 0
+    top_score: float = 0.0
+    fallback: bool = False  # 是否追加了全局向量兜底
+    min_score: float = 0.0
+
+
+class TraceParams(BaseModel):
+    """本次请求实际使用的检索参数。"""
+
+    top_k: int = 0
+    filters: dict[str, Any] = Field(default_factory=dict)
+    rerank_strategy: str | None = None
 
 
 class TraceFusion(BaseModel):
@@ -80,9 +110,12 @@ class TraceTimings(BaseModel):
 class QueryTrace(BaseModel):
     """检索过程快照，仅在 debug=true 时返回。"""
 
-    features: list[str] = Field(default_factory=list)
-    active: list[str] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)  # 请求的特性集
+    applied: list[str] = Field(default_factory=list)  # 真正生效的特性集
+    skipped: list[TraceSkip] = Field(default_factory=list)  # 请求了但空转的特性
+    params: TraceParams = Field(default_factory=TraceParams)
     plan: TracePlan = Field(default_factory=TracePlan)
+    routing: TraceRouting = Field(default_factory=TraceRouting)
     channels: list[TraceChannel] = Field(default_factory=list)
     fusion: TraceFusion = Field(default_factory=TraceFusion)
     timings: TraceTimings = Field(default_factory=TraceTimings)

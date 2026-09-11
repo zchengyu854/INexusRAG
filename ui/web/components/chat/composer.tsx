@@ -3,8 +3,8 @@
 import { useRef, type KeyboardEvent } from "react"
 import { Loader2, Send, Trash2 } from "lucide-react"
 
+import { RetrievalSettings, type RetrievalConfig } from "@/components/chat/retrieval-settings"
 import { Button } from "@/components/ui/button"
-import { FeatureToggle } from "@/components/chat/feature-toggle"
 
 export function Composer({
   value,
@@ -13,8 +13,8 @@ export function Composer({
   onClear,
   loading,
   canClear,
-  features,
-  onFeaturesChange,
+  settings,
+  onSettingsChange,
 }: {
   value: string
   onChange: (next: string) => void
@@ -22,8 +22,8 @@ export function Composer({
   onClear: () => void
   loading: boolean
   canClear: boolean
-  features: Record<string, boolean>
-  onFeaturesChange: (next: Record<string, boolean>) => void
+  settings: RetrievalConfig
+  onSettingsChange: (next: RetrievalConfig) => void
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -36,7 +36,7 @@ export function Composer({
   return (
     <div className="shrink-0 border-t border-border bg-card px-3 py-2.5">
       <div className="mb-1.5 flex items-center justify-between gap-2">
-        <FeatureToggle checked={features} onChange={onFeaturesChange} />
+        <RetrievalSettings value={settings} onChange={onSettingsChange} disabled={loading} />
         <Button
           variant="ghost"
           size="xs"

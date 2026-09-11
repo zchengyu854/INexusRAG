@@ -371,7 +371,14 @@ def query(request: QueryRequest):
             conversation_id=conversation_id,
         )
 
-    results = multi_query_search(request.question, top_k=request.top_k, filters=request.filters, features=request.features, debug=request.debug)
+    results = multi_query_search(
+        request.question,
+        top_k=request.top_k,
+        filters=request.filters,
+        features=request.features,
+        rerank_strategy=request.rerank_strategy,
+        debug=request.debug,
+    )
     trace_data: dict | None = None
     if request.debug and isinstance(results, dict):
         trace_data = results["trace"]

@@ -1,6 +1,7 @@
 """混合检索：向量通道 + 关键词通道，RRF（倒数排名融合）合并；复杂问题多查询分解。"""
 from __future__ import annotations
 
+import os
 import re
 
 import jieba
@@ -74,23 +75,58 @@ _ROUTE_TOP = 3
 _MIN_ROUTE_SCORE = 0.3  # ponytail: 余弦阈值未校准（bge-m3），观测到路由漏检后调
 
 
-def two_stage_search(query_embedding: list[float], top_k: int, terms: list[str], filters: dict | None = None, use_routing: bool = True) -> list[dict]:
-    """两级检索：先路由命中目标文档，再在目标文档内检索；关键词通道全局兑底。use_routing=False 时只做全局向量检索。"""
+def two_stage_search(
+    query_embedding: list[float],
+    top_k: int,
+    terms: list[str],
+    filters: dict | None = None,
+    use_routing: bool = True,
+    stats: dict | None = None,
+) -> list[dict]:
+    """两级检索：先路由命中目标文档，再在目标文档内检索；关键词通道全局兑底。use_routing=False 时只做全局向量检索。
+
+    stats 为可选的出参字典，仅在需要观测时传入（用于 /api/query 的 debug trace）。
+    传 None 时全部记账代码被跳过，检索路径与不传时完全一致。
+    """
     limit = max(top_k * 5, 25)
     channels: list[list[dict]] = []
     if terms:
-        channels.append(keyword_chunks(terms, limit=limit, filters=filters))
+        keyword_rows = keyword_chunks(terms, limit=limit, filters=filters)
+        if stats is not None:
+            stats["keywords"] = stats.get("keywords", 0) + len(keyword_rows)
+        channels.append(keyword_rows)
     if not use_routing:
-        channels.append(search_chunks(query_embedding, top_k=limit, filters=filters))
+        vector_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+        if stats is not None:
+            stats["vector"] = stats.get("vector", 0) + len(vector_rows)
+        channels.append(vector_rows)
         return rrf_merge(channels, top_k) if channels else []
     routed = search_doc_index(query_embedding, top_k=_ROUTE_TOP)
+    if stats is not None:
+        # 多查询时每条查询各自路由，这里按 doc_id 去重统计，避免「命中 8 篇文档」式的误读
+        stats.setdefault("route_top_score", round(float(routed[0]["score"]), 4) if routed else 0.0)
+        stats.setdefault("route_fallback", False)
+        stats.setdefault("routed_doc_ids", set()).update(row["doc_id"] for row in routed)
     if routed:
         for row in routed:
-            channels.append(search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters))
+            doc_rows = search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters)
+            if stats is not None:
+                stats["vector"] = stats.get("vector", 0) + len(doc_rows)
+            channels.append(doc_rows)
         if routed[0]["score"] < _MIN_ROUTE_SCORE:
-            channels.append(search_chunks(query_embedding, top_k=limit, filters=filters))
+            # 路由置信度不足，补一路全局向量兜底
+            fallback_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+            if stats is not None:
+                stats["vector"] = stats.get("vector", 0) + len(fallback_rows)
+                stats["route_fallback"] = True
+            channels.append(fallback_rows)
     else:
-        channels.append(search_chunks(query_embedding, top_k=limit, filters=filters))
+        # 路由层没有命中任何文档（如 doc_index 为空），退回全局向量
+        fallback_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+        if stats is not None:
+            stats["vector"] = stats.get("vector", 0) + len(fallback_rows)
+            stats["route_fallback"] = True
+        channels.append(fallback_rows)
     if not channels:
         return []
     return rrf_merge(channels, top_k)
@@ -156,90 +192,173 @@ def multi_query_search(
     filters: dict | None = None,
     features: list[str] | None = None,
     debug: bool = False,
+    rerank_strategy: str | None = None,
 ) -> list[dict] | dict:
     """多查询：features 控制通道开关（None = 默认全开除 rerank）→ 两级检索 → RRF → 可选 rerank。
 
-    debug=True 时返回 {"results": [...], "trace": {...}}，只为把过程暴露给检视面板，
-    不重复跑一遍检索。debug=False（默认）时不构造任何 trace 结构，路径与改动前一致。
+    debug=True 时返回 {"results": [...], "trace": {...}}，只为把过程暴露给检视面板，不重复跑检索。
+    trace 区分「请求的」与「真正生效的」：applied 是实际起了作用的通道，空转或被降级的进 skipped
+    并附原因（例如 LLM 未配置导致规划类特性失效），避免面板把空转的开关显示成生效。
+    debug=False（默认）时不构建 trace、不记账，检索路径与改动前一致。
     """
     import time as _time
 
     from src.ingestion.embedder import get_embedder
 
     t_start = _time.perf_counter() if debug else 0.0
-    active = set(_DEFAULT_FEATURES) if features is None else set(features)
+    requested = set(_DEFAULT_FEATURES) if features is None else set(features)
+    wants_plan = bool({"decompose", "stepback", "hyde"} & requested)
     # 只有启用规划类特性才付 LLM 规划调用
-    plan = plan_question(question) if {"decompose", "stepback", "hyde"} & active else {"subs": [], "step_back": None, "hyde": None}
+    plan = plan_question(question) if wants_plan else {"subs": [], "step_back": None, "hyde": None}
     t_planned = _time.perf_counter() if debug else 0.0
+
     queries = [question]
-    if "decompose" in active:
-        queries += [s for s in plan["subs"] if s != question]
-    if "stepback" in active and plan["step_back"] and plan["step_back"] != question:
+    sub_queries: list[str] = []
+    if "decompose" in requested:
+        sub_queries = [s for s in plan["subs"] if s != question]
+        queries += sub_queries
+    step_back_used = bool("stepback" in requested and plan["step_back"] and plan["step_back"] != question)
+    if step_back_used:
         queries.append(plan["step_back"])
     vectors = get_embedder().encode(queries)
-    use_routing = "routing" in active
+    use_routing = "routing" in requested
+    # 仅 debug 时记账；传 None 会让 two_stage_search 跳过全部计数代码
+    stats: dict | None = {} if debug else None
 
     def _search(query: str, vector: list[float]) -> list[dict]:
         return two_stage_search(
             vector, top_k=top_k,
-            terms=(extract_terms(query) if "keywords" in active else []),
-            filters=filters, use_routing=use_routing,
+            terms=(extract_terms(query) if "keywords" in requested else []),
+            filters=filters, use_routing=use_routing, stats=stats,
         )
 
     channels: list[list[dict]] = []
     primary = _search(queries[0], vectors[0])
     channels.append(primary)
-    expanded = [_search(q, vec) for q, vec in zip(queries[1:], vectors[1:])]
+    expanded = [_search(query, vector) for query, vector in zip(queries[1:], vectors[1:])]
     channels.extend(expanded)
+    hyde_used = bool("hyde" in requested and plan["hyde"])
     hyde_rows: list[dict] = []
-    if "hyde" in active and plan["hyde"]:
+    if hyde_used:
         hyde_vec = get_embedder().encode([plan["hyde"]])[0]
-        hyde_rows = two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing)
+        hyde_rows = two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing, stats=stats)
         channels.append(hyde_rows)
     graph_rows: list[dict] = []
-    if "graph" in active:
+    if "graph" in requested:
         # 图谱通道：复用原问题的向量做实体锚点，零额外 embedding 成本
         from src.graph import graph_channel
         graph_rows = graph_channel(vectors[0], top_k=max(top_k * 5, 25), filters=filters)
         channels.append(graph_rows)
     t_retrieved = _time.perf_counter() if debug else 0.0
 
-    merged = rrf_merge(channels, top_k if "rerank" not in active else top_k * 5)
+    merged = rrf_merge(channels, top_k if "rerank" not in requested else top_k * 5)
     fused_count = len(merged) if debug else 0
-    strategy = None
-    if "rerank" in active and merged:
+    rerank_used = False
+    effective_strategy: str | None = None
+    if "rerank" in requested and merged:
         from src.rerank import rerank
-        import os as _os
-        strategy = _os.getenv("RERANK_STRATEGY", "rrf").lower()
-        merged = rerank(question, merged, top_k)
+        effective_strategy = (rerank_strategy or os.getenv("RERANK_STRATEGY", "rrf")).lower()
+        merged = rerank(question, merged, top_k, strategy=effective_strategy)
+        rerank_used = True
 
     if not debug:
         return merged
 
-    trace_channels = [{"name": "primary", "label": "主查询", "hits": len(primary)}]
-    if expanded:
-        trace_channels.append({"name": "expanded", "label": "扩展查询", "hits": sum(len(rows) for rows in expanded)})
-    if "hyde" in active and plan["hyde"]:
-        trace_channels.append({"name": "hyde", "label": "假想文档", "hits": len(hyde_rows)})
-    if "graph" in active:
-        trace_channels.append({"name": "graph", "label": "图谱", "hits": len(graph_rows)})
+    from src.llm.client import get_llm
+
+    assert stats is not None
+    llm_available = get_llm().enabled if wants_plan else False
+    routed_docs = len(stats.get("routed_doc_ids", ()))
+    applied: list[str] = []
+    skipped: list[dict] = []
+
+    if "routing" in requested:
+        if routed_docs > 0:
+            applied.append("routing")
+            if stats.get("route_fallback"):
+                skipped.append({
+                    "name": "routing",
+                    "reason": f"最高路由分低于阈值 {_MIN_ROUTE_SCORE}，已补一路全局向量兜底",
+                })
+        else:
+            skipped.append({"name": "routing", "reason": "路由层未命中任何文档（doc_index 可能为空），已退回全局向量"})
+    if "keywords" in requested:
+        if stats.get("keywords", 0) > 0:
+            applied.append("keywords")
+        else:
+            skipped.append({"name": "keywords", "reason": "未从问题中提取到有效关键词"})
+    for name, used, absent_reason in (
+        ("decompose", bool(sub_queries), "该问题无需拆分（未产出子问题）"),
+        ("stepback", step_back_used, "该问题已足够抽象（未产出退步问题）"),
+        ("hyde", hyde_used, "该问题为事实型（未产出假想段落）"),
+    ):
+        if name not in requested:
+            continue
+        if used:
+            applied.append(name)
+        else:
+            skipped.append({
+                "name": name,
+                "reason": "LLM 未配置，检索规划未执行" if not llm_available else absent_reason,
+            })
+    if "graph" in requested:
+        if graph_rows:
+            applied.append("graph")
+        else:
+            skipped.append({"name": "graph", "reason": "图谱通道无命中（图谱未构建，或问题与实体锚点不匹配）"})
+    if "rerank" in requested:
+        if rerank_used:
+            applied.append("rerank")
+        else:
+            skipped.append({"name": "rerank", "reason": "候选为空，未执行重排"})
+
+    trace_channels: list[dict] = []
+    if "routing" in requested:
+        note = "，已兜底全局" if stats.get("route_fallback") else ""
+        trace_channels.append({
+            "name": "routing", "label": "路由", "hits": routed_docs,
+            "detail": f"命中 {routed_docs} 篇文档{note}",
+        })
+    if "keywords" in requested:
+        trace_channels.append({"name": "keywords", "label": "关键词", "hits": stats.get("keywords", 0), "detail": None})
+    trace_channels.append({
+        "name": "vector", "label": "向量", "hits": stats.get("vector", 0),
+        "detail": f"{len(queries)} 条查询合并" if len(queries) > 1 else None,
+    })
+    if hyde_used:
+        trace_channels.append({"name": "hyde", "label": "假想文档", "hits": len(hyde_rows), "detail": None})
+    if "graph" in requested:
+        trace_channels.append({"name": "graph", "label": "图谱", "hits": len(graph_rows), "detail": None})
+
     return {
         "results": merged,
         "trace": {
-            "features": sorted(active),
-            "active": sorted(active),
+            "features": sorted(requested),
+            "applied": applied,
+            "skipped": skipped,
+            "params": {
+                "top_k": top_k,
+                "filters": filters or {},
+                "rerank_strategy": effective_strategy,
+            },
             "plan": {
                 "subs": list(plan["subs"]),
                 "step_back": plan["step_back"],
                 "hyde": plan["hyde"],
                 "queries": list(queries),
             },
+            "routing": {
+                "routed_docs": routed_docs,
+                "top_score": stats.get("route_top_score", 0.0),
+                "fallback": bool(stats.get("route_fallback")),
+                "min_score": _MIN_ROUTE_SCORE,
+            },
             "channels": trace_channels,
             "fusion": {
                 "channels": len(channels),
                 "pre_merge": len({row["chunk_id"] for channel in channels for row in channel}),
                 "post_merge": fused_count,
-                "rerank": strategy,
+                "rerank": effective_strategy if rerank_used else None,
                 "final": len(merged),
             },
             "timings": {

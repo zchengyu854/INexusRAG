@@ -100,10 +100,18 @@ export type LLMProviderDraft = Omit<LLMProvider, "id" | "created_at">
 
 // ---- 检索 trace（仅 debug=true 时后端返回）----
 
+export type RerankStrategy = "rrf" | "cross" | "llm" | "colbert"
+
 export interface TraceChannel {
   name: string
   label: string
   hits: number
+  detail?: string | null
+}
+
+export interface TraceSkip {
+  name: string
+  reason: string
 }
 
 export interface TracePlan {
@@ -111,6 +119,19 @@ export interface TracePlan {
   step_back: string | null
   hyde: string | null
   queries: string[]
+}
+
+export interface TraceRouting {
+  routed_docs: number
+  top_score: number
+  fallback: boolean
+  min_score: number
+}
+
+export interface TraceParams {
+  top_k: number
+  filters: Record<string, unknown>
+  rerank_strategy: string | null
 }
 
 export interface TraceFusion {
@@ -128,9 +149,12 @@ export interface TraceTimings {
 }
 
 export interface QueryTrace {
-  features: string[]
-  active: string[]
+  features: string[]   // 请求的特性集
+  applied: string[]    // 真正生效的特性集
+  skipped: TraceSkip[] // 请求了但空转的特性
+  params: TraceParams
   plan: TracePlan
+  routing: TraceRouting
   channels: TraceChannel[]
   fusion: TraceFusion
   timings: TraceTimings
@@ -315,14 +339,18 @@ export interface QueryResult {
   trace?: QueryTrace | null
 }
 
-export async function queryDoc(
-  question: string,
-  conversationId: string,
-  topK = 5,
-  filters?: Record<string, string | number | boolean>,
-  features?: string[],
-  debug = false
-): Promise<QueryResult> {
+export interface QueryOptions {
+  conversationId: string
+  topK?: number
+  filters?: Record<string, string | number | boolean> | null
+  features?: string[] | null
+  rerankStrategy?: RerankStrategy | null
+  debug?: boolean
+}
+
+export async function queryDoc(question: string, options: QueryOptions): Promise<QueryResult> {
+  const { conversationId, topK = 5, filters, features, rerankStrategy, debug = false } = options
+  const hasFilters = filters && Object.keys(filters).length > 0
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -330,8 +358,9 @@ export async function queryDoc(
       question,
       conversation_id: conversationId,
       top_k: topK,
-      ...(filters ? { filters } : {}),
+      ...(hasFilters ? { filters } : {}),
       ...(features ? { features } : {}),
+      ...(rerankStrategy ? { rerank_strategy: rerankStrategy } : {}),
       ...(debug ? { debug: true } : {}),
     }),
   })

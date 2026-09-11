@@ -97,11 +97,16 @@ def _score_colbert(query: str, candidates: list[dict]) -> list[float]:
 _STRATEGIES = {"rrf": _score_rrf, "cross": _score_cross, "llm": _score_llm, "colbert": _score_colbert}
 
 
-def rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
-    """按 RERANK_STRATEGY（默认 rrf）重排 candidates，返回前 top_k 并写入 rerank_score。"""
+def rerank(query: str, candidates: list[dict], top_k: int, strategy: str | None = None) -> list[dict]:
+    """按 RERANK_STRATEGY（默认 rrf）重排 candidates，返回前 top_k 并写入 rerank_score。
+
+    strategy 显式传入时优先于环境变量，供请求级切换（问答页的「重排策略」选项）。
+    """
     if not candidates:
         return []
-    strategy = os.getenv("RERANK_STRATEGY", "rrf").lower()
+    if strategy is None:
+        strategy = os.getenv("RERANK_STRATEGY", "rrf")
+    strategy = strategy.lower()
     if strategy not in _STRATEGIES:
         raise ValueError(f"未知 RERANK_STRATEGY: {strategy}（可选 {sorted(_STRATEGIES)}）")
     scores = _STRATEGIES[strategy](query, candidates)

@@ -13,6 +13,12 @@ import {
 } from "@/components/chat/feature-toggle"
 import { MessageThread, STAGES, type ChatMessageView } from "@/components/chat/message-thread"
 import { RetrievalInspector } from "@/components/chat/retrieval-inspector"
+import {
+  filtersToRecord,
+  type FilterRow,
+  type RerankChoice,
+  type RetrievalConfig,
+} from "@/components/chat/retrieval-settings"
 import { buttonVariants } from "@/components/ui/button"
 import {
   clearConversation,
@@ -24,18 +30,44 @@ import {
 import { cn } from "@/lib/utils"
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
-const FEATURES_KEY = "nexus-rag-features"
+const SETTINGS_KEY = "nexus-rag-retrieval-settings"
 const STAGE_INTERVAL_MS = 1400
+const RERANK_CHOICES: RerankChoice[] = ["auto", "rrf", "cross", "llm", "colbert"]
 
-function readStoredFeatures(): Record<string, boolean> {
+function defaultSettings(): RetrievalConfig {
+  return {
+    features: initialFeatureState(DEFAULT_FEATURES),
+    topK: 5,
+    rerankStrategy: "auto",
+    filters: [],
+  }
+}
+
+function readStoredSettings(): RetrievalConfig {
+  const base = defaultSettings()
   try {
-    const raw = window.localStorage.getItem(FEATURES_KEY)
-    if (!raw) return initialFeatureState(DEFAULT_FEATURES)
-    const parsed: unknown = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return initialFeatureState(DEFAULT_FEATURES)
-    return initialFeatureState(parsed as string[])
+    const raw = window.localStorage.getItem(SETTINGS_KEY)
+    if (!raw) return base
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    return {
+      features: Array.isArray(parsed.features)
+        ? initialFeatureState(parsed.features as string[])
+        : base.features,
+      topK:
+        typeof parsed.topK === "number" && parsed.topK >= 1 && parsed.topK <= 50
+          ? parsed.topK
+          : base.topK,
+      rerankStrategy: RERANK_CHOICES.includes(parsed.rerankStrategy as RerankChoice)
+        ? (parsed.rerankStrategy as RerankChoice)
+        : base.rerankStrategy,
+      filters: Array.isArray(parsed.filters)
+        ? (parsed.filters as FilterRow[]).filter(
+            (row) => row && typeof row.key === "string" && typeof row.value === "string"
+          )
+        : base.filters,
+    }
   } catch {
-    return initialFeatureState(DEFAULT_FEATURES)
+    return base
   }
 }
 
@@ -50,7 +82,7 @@ export function ChatPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [stageIndex, setStageIndex] = useState(0)
-  const [features, setFeatures] = useState<Record<string, boolean>>(() => initialFeatureState(DEFAULT_FEATURES))
+  const [settings, setSettings] = useState<RetrievalConfig>(() => defaultSettings())
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [inspectingId, setInspectingId] = useState<string | null>(null)
 
@@ -70,7 +102,7 @@ export function ChatPage() {
     // 只在挂载时解析一次 URL / 本地存储，后续切换由交互驱动。
     // 延后一拍执行，避免在 effect 体内同步 setState（仓库既有约定）。
     const timer = window.setTimeout(() => {
-      setFeatures(readStoredFeatures())
+      setSettings(readStoredSettings())
       const fromUrl = searchParams.get("conversation")
       const stored = window.localStorage.getItem(CONVERSATION_KEY)
       const initial = fromUrl || stored
@@ -117,9 +149,12 @@ export function ChatPage() {
     bottomRef.current?.scrollIntoView({ block: "end" })
   }, [messages, loading])
 
-  function persistFeatures(next: Record<string, boolean>) {
-    setFeatures(next)
-    window.localStorage.setItem(FEATURES_KEY, JSON.stringify(selectedFeatures(next)))
+  function persistSettings(next: RetrievalConfig) {
+    setSettings(next)
+    window.localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ ...next, features: selectedFeatures(next.features) })
+    )
   }
 
   function selectConversation(id: string) {
@@ -156,7 +191,7 @@ export function ChatPage() {
       router.replace(`/chat?conversation=${encodeURIComponent(cid)}`, { scroll: false })
     }
 
-    const activeFeatures = selectedFeatures(features)
+    const activeFeatures = selectedFeatures(settings.features)
     setMessages((previous) => [
       ...previous,
       { id: `local-user-${Date.now()}`, role: "user", content: question },
@@ -167,7 +202,14 @@ export function ChatPage() {
     setLoading(true)
 
     try {
-      const result = await queryDoc(question, cid, 5, undefined, activeFeatures, true)
+      const result = await queryDoc(question, {
+        conversationId: cid,
+        topK: settings.topK,
+        filters: filtersToRecord(settings.filters),
+        features: activeFeatures,
+        rerankStrategy: settings.rerankStrategy === "auto" ? null : settings.rerankStrategy,
+        debug: true,
+      })
       const assistantId = `local-assistant-${Date.now()}`
       setMessages((previous) => [
         ...previous,
@@ -258,8 +300,8 @@ export function ChatPage() {
           onClear={handleClear}
           loading={loading}
           canClear={messages.length > 0}
-          features={features}
-          onFeaturesChange={persistFeatures}
+          settings={settings}
+          onSettingsChange={persistSettings}
         />
       </section>
 
