@@ -61,7 +61,10 @@ def _patches(llm, tss=None, graph=None):
 
 class RunAgentTests(unittest.TestCase):
     def test_returns_none_when_llm_disabled(self):
-        out = run_agent("问题", top_k=3)
+        # 必须显式 mock：否则会依赖「环境是否配了 LLM_API_KEY」，
+        # 配了的话这里会真的打一次 LLM + 查库（既慢又让测试失去意义）
+        with patch("src.llm.client.get_llm", return_value=FakeLLM(enabled=False)):
+            out = run_agent("问题", top_k=3)
         self.assertIsNone(out)
 
     def test_returns_none_when_agent_answers_without_evidence(self):
