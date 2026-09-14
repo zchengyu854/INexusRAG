@@ -86,6 +86,14 @@ class RunAgentTests(unittest.TestCase):
         self.assertEqual(out["trace"]["steps"][0]["new_chunks"], 2)
         self.assertEqual(out["trace"]["evidence_chunks"], 2)
 
+    def test_on_step_fires_after_each_recorded_step(self):
+        llm = FakeLLM(actions=[{"thought": "先查", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        seen: list[str] = []
+        patches = _patches(llm, tss=lambda *a, **k: [row("a", 0.9)])
+        with _enter(patches):
+            run_agent("问题", top_k=3, on_step=lambda rec: seen.append(rec["tool"]))
+        self.assertEqual(seen, ["search_knowledge", "answer"])
+
     def test_tool_error_does_not_abort_loop(self):
         """工具报错只记一步 error，循环继续（失败静默降级，但不整体失败）。"""
         llm = FakeLLM(actions=[
@@ -202,6 +210,69 @@ class RunAgentTests(unittest.TestCase):
         with _enter(patches):
             out = run_agent("问题")
         self.assertEqual(out["trace"]["termination"], "answered")
+
+    def test_rerank_reorders_final_evidence_when_feature_enabled(self):
+        """features 含 rerank：整个循环结束后对累积证据池做一次终排，trace 记录策略。"""
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        patches = _patches(llm, tss=lambda *a, **k: [row("a", 0.9), row("b", 0.8)])
+
+        def fake_rerank(query, candidates, top_k, strategy=None):
+            self.assertEqual(strategy, "cross")
+            return [row("b", 0.8), row("a", 0.9)][:top_k]
+
+        with _enter(patches + [patch("src.rerank.rerank", side_effect=fake_rerank)]):
+            out = run_agent("问题", top_k=2, features=["rerank"], rerank_strategy="cross")
+        self.assertIsNotNone(out)
+        self.assertEqual([r["chunk_id"] for r in out["results"]], ["b", "a"])  # 重排序生效
+        self.assertEqual(out["trace"]["rerank"], "cross")
+
+    def test_rerank_skipped_when_feature_absent(self):
+        """features 不含 rerank（含 None）时不重排，与管线 None=默认集（无 rerank）语义一致。"""
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        patches = _patches(llm, tss=lambda *a, **k: [row("a", 0.9)])
+        with _enter(patches):
+            out = run_agent("问题", top_k=1)
+        self.assertIsNone(out["trace"].get("rerank"))
+        self.assertEqual([r["chunk_id"] for r in out["results"]], ["a"])
+
+    def test_rerank_failure_degrades_to_rrf_order(self):
+        """重排模型缺失等失败不致命：退回 RRF 序，trace.rerank 为 None。"""
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        patches = _patches(llm, tss=lambda *a, **k: [row("a", 0.9), row("b", 0.8)])
+        with _enter(patches + [patch("src.rerank.rerank", side_effect=RuntimeError("cross-encoder 未下载"))]):
+            out = run_agent("问题", top_k=2, features=["rerank"])
+        self.assertEqual([r["chunk_id"] for r in out["results"]], ["a", "b"])
+        self.assertIsNone(out["trace"]["rerank"])
+
+    def test_search_knowledge_shares_pipeline_basic_devices(self):
+        """search_knowledge 与管线共用基础装置：改写查询 + 法条精确注入 + 相关性过滤。"""
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge",
+                                "args": {"query": "民法典的二百三十条是什么？"}}])
+        captured: dict = {}
+
+        def fake_terms(question, max_terms=12):
+            return ["二百三十"] if "二百三十" in question else []
+
+        def fake_tss(vector, top_k, terms, filters=None, use_routing=True, stats=None):
+            captured["terms"] = terms
+            return [{"chunk_id": "a", "text": "民法典 第二百三十条 因继承取得物权", "score": 0.9}]
+
+        patches = [
+            patch("src.llm.client.get_llm", return_value=llm),
+            patch("src.ingestion.embedder.get_embedder", return_value=FakeEmbedder()),
+            patch("src.retrieval.extract_terms", side_effect=fake_terms),
+            patch("src.retrieval.two_stage_search", side_effect=fake_tss),
+            patch("src.retrieval.keyword_chunks",
+                  return_value=[{"chunk_id": "k", "text": "民法典 第二百三十条 因继承取得物权", "score": 0.0}]),
+        ]
+        with _enter(patches):
+            out = run_agent("问题", top_k=5)
+        self.assertIsNotNone(out)
+        # 改写后的查询喂给了检索（去后缀 + 归一法条），而不是原始口语问句
+        self.assertEqual(captured["terms"], ["二百三十"])
+        # 法条精确通道把真法条切片补进了候选集
+        self.assertEqual([r["chunk_id"] for r in out["results"]], ["a", "k"])
+        self.assertEqual(out["trace"]["steps"][0]["new_chunks"], 2)
 
 
 class ChatWithToolsTests(unittest.TestCase):

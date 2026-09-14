@@ -16,6 +16,8 @@ Agentic 是按需跑 N 步。因此这里不需要路由器：每一步的工具
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import time
 from typing import Any
 
@@ -27,16 +29,14 @@ _MAX_SUMMARY_ROWS = 6
 _STAGNANT_LIMIT = 2
 
 _SYSTEM_PROMPT = (
-    "You are a retrieval agent for a knowledge base. Your only job is to gather enough "
-    "evidence to answer the question; you never write the final answer yourself.\n\n"
-    "Rules:\n"
-    "1. Call exactly one tool per step.\n"
-    "2. Call answer as soon as the collected evidence is sufficient. Do not over-search.\n"
-    "3. If a search returned nothing new, change your angle: different wording, a narrower "
-    "sub-question, or try the graph. Never repeat a query you already tried.\n"
-    "4. For multi-hop questions, expect to search more than once and to combine evidence "
-    "from different documents.\n"
-    "5. Keep any reasoning text short and in the user's language."
+    "你是知识库检索代理。只负责收集足够证据，不要撰写最终答案。\n\n"
+    "规则：\n"
+    "1. 每步只调用一个工具。\n"
+    "2. 证据已经够回答问题时，立刻调用 answer，不要为了完整而反复搜索。\n"
+    "3. 若本步没有新证据，必须换角度：改写查询、收窄子问题，或改用图谱。"
+    "禁止重复已经用过的 query。\n"
+    "4. 多跳问题预期会搜多次，并拼接不同文档里的片段。\n"
+    "5. 思考文字要短，使用用户提问的语言。"
 )
 
 
@@ -94,20 +94,33 @@ TOOL_SCHEMAS: dict[str, dict] = {
 
 
 def _tool_search_knowledge(query: str, top_k: int, filters: dict | None) -> list[dict]:
-    """主力召回：向量 + 关键词 + 文档路由，RRF 融合（复用 two_stage_search）。"""
+    """主力召回：向量 + 关键词 + 文档路由 + 法条精确通道 + 相关性过滤（复用检索层全部基础装置）。
+
+    与管线模式同一套改写/过滤逻辑：agent 拿到的"no results"是真实的无证据信号，
+    会驱动它换角度重查，而不是把噪声当成证据继续推进。
+    """
     if not query:
         return []
     from src.ingestion.embedder import get_embedder
-    from src.retrieval import extract_terms, two_stage_search
+    from src.retrieval import (
+        _relevance_filter,
+        extract_terms,
+        inject_article_channel,
+        rewrite_query,
+        two_stage_search,
+    )
 
-    vector = get_embedder().encode([query])[0]
-    return two_stage_search(
+    rewritten = rewrite_query(query)
+    vector = get_embedder().encode([rewritten])[0]
+    rows = two_stage_search(
         vector,
         top_k=top_k,
-        terms=extract_terms(query),
+        terms=extract_terms(rewritten),
         filters=filters,
         use_routing=True,
     )
+    rows = inject_article_channel(rewritten, rows, top_k)
+    return _relevance_filter(rows, rewritten)
 
 
 def _tool_search_graph(query: str, top_k: int, filters: dict | None) -> list[dict]:
@@ -272,12 +285,18 @@ def run_agent(
     features: list[str] | None = None,
     max_llm_calls: int | None = None,
     max_seconds: float = 45.0,
+    rerank_strategy: str | None = None,
+    on_step: Callable[[dict], None] | None = None,
 ) -> dict | None:
     """Agentic 检索：自主多轮，最多 max_steps 步。
 
     返回 {"results": [...], "trace": {...}}；**任一致命失败或无证据一律返回 None**，
     由调用方退回 multi_query_search。不在此处生成回答——生成统一由 routes 负责，
     这样 [Source N] 引用、figures、落库、history 处理只有一份逻辑。
+
+    rerank：features 显式包含 "rerank" 时，对整个循环累积的证据池做一次终排
+    （只在收尾排一次，不是每步都排，避免重排开销乘以步数）。features=None 保持
+    旧行为不重排——与管线模式 None=默认集（无 rerank）的语义一致。
 
     trace 结构：{"steps": [...], "termination": ..., "budget": {...}, "evidence_chunks": int}
     termination: answered | budget | max_steps | stagnant | error
@@ -307,7 +326,10 @@ def run_agent(
             action = llm.chat_with_tools(_messages(question, steps, scratch.summary()), schemas)
         except Exception as exc:
             # LLM 中途挂掉：不整体失败，用已收集的证据收敛
-            steps.append(_trace_step(step, None, "answer", {"error": str(exc)}))
+            record = _trace_step(step, None, "answer", {"error": str(exc)})
+            steps.append(record)
+            if on_step is not None:
+                on_step(record)
             termination = "error"
             break
 
@@ -317,6 +339,8 @@ def run_agent(
 
         if name == "answer" or name not in impl:
             steps.append(record)
+            if on_step is not None:
+                on_step(record)
             termination = "answered"
             break
 
@@ -328,6 +352,8 @@ def run_agent(
             record["error"] = str(exc)
             record["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
             steps.append(record)
+            if on_step is not None:
+                on_step(record)
             continue
 
         new_chunks = scratch.add(rows)
@@ -335,6 +361,8 @@ def run_agent(
         record["observation"] = _summarize(rows)
         record["latency_ms"] = round((time.perf_counter() - started) * 1000, 1)
         steps.append(record)
+        if on_step is not None:
+            on_step(record)
 
         # 边际收益为 0：连续两步没拿到新证据，强制收敛，避免模型空转烧预算
         stagnant = stagnant + 1 if new_chunks == 0 else 0
@@ -343,6 +371,21 @@ def run_agent(
             break
 
     results = scratch.ranked(top_k)
+    rerank_used = False
+    effective_strategy: str | None = None
+    if features is not None and "rerank" in set(features) and scratch.size > 0:
+        import os
+
+        from src.rerank import rerank as _rerank
+
+        effective_strategy = (rerank_strategy or os.getenv("RERANK_STRATEGY", "rrf")).lower()
+        try:
+            candidates = scratch.ranked(max(top_k * 5, 25))
+            results = _rerank(question, candidates, top_k, strategy=effective_strategy)
+            rerank_used = True
+        except Exception:
+            # 重排失败不致命：退回 RRF 序，agent 整体仍静默降级
+            results = scratch.ranked(top_k)
     if not results:
         return None
     return {
@@ -353,5 +396,6 @@ def run_agent(
             "budget": budget.snapshot(),
             "evidence_chunks": scratch.size,
             "tools": tool_names,
+            "rerank": effective_strategy if rerank_used else None,
         },
     }
