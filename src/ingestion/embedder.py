@@ -85,7 +85,11 @@ class Embedder:
             raise ImportError("使用本地 embedding 需要安装 sentence-transformers: uv add sentence-transformers")
 
         model_name = _get_env("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3")
-        return SentenceTransformer(model_name, local_files_only=True)
+        # 设备可配：默认自动（Apple Silicon 上会选 MPS）。MPS 显存被其他进程占满时
+        # 会报 "MPS out of memory" / "Cannot copy out of meta tensor"，此时设
+        # LOCAL_EMBEDDING_DEVICE=cpu 可强制走 CPU（慢一些但不依赖 GPU 池）。
+        device = os.getenv("LOCAL_EMBEDDING_DEVICE").strip() if os.getenv("LOCAL_EMBEDDING_DEVICE") else None
+        return SentenceTransformer(model_name, local_files_only=True, device=device)
 
     def encode(self, texts: Iterable[str]) -> list[list[float]]:
         """

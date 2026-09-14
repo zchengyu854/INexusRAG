@@ -35,6 +35,53 @@ def load_pdf_pages(path: Path | str) -> list[tuple[int, str]]:
     return pages
 
 
+def _eligible_page_images(page, max_per_page: int = 3, min_width: int = 40, min_height: int = 40):
+    """页面上可展示的嵌入图：(index, xref, width, height)，index 为过滤后序号。"""
+    kept = 0
+    for img in page.get_images():
+        xref, width, height = img[0], img[2], img[3]
+        if width < min_width or height < min_height:
+            continue
+        yield kept, xref, width, height
+        kept += 1
+        if kept >= max_per_page:
+            return
+
+
+def list_page_images(path: Path | str, pages: list[int], max_per_page: int = 3) -> list[dict]:
+    """列出 PDF 指定页的嵌入图元数据（不编码像素），返回 [{page, index, width, height}]。"""
+    out: list[dict] = []
+    with pymupdf.open(path) as doc:
+        for page_number in sorted(set(pages)):
+            if not (1 <= page_number <= doc.page_count):
+                continue
+            page = doc[page_number - 1]
+            for index, _xref, width, height in _eligible_page_images(page, max_per_page):
+                out.append({"page": page_number, "index": index, "width": width, "height": height})
+                if len(out) >= 6:  # ponytail: 总量上限 6 张
+                    return out
+    return out
+
+
+def extract_page_image_png(path: Path | str, page_number: int, index: int, max_per_page: int = 3) -> bytes | None:
+    """按 list_page_images 的 index 取出单张 PNG 字节；不存在返回 None。"""
+    with pymupdf.open(path) as doc:
+        if not (1 <= page_number <= doc.page_count):
+            return None
+        page = doc[page_number - 1]
+        for img_index, xref, _width, _height in _eligible_page_images(page, max_per_page):
+            if img_index != index:
+                continue
+            pix = pymupdf.Pixmap(doc, xref)
+            if pix.colorspace and pix.colorspace.n > 3:
+                pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+            png = pix.tobytes("png")
+            if len(png) > 512 * 1024:
+                return None
+            return png
+    return None
+
+
 def extract_page_images(path: Path | str, pages: list[int], max_per_page: int = 3) -> list[dict]:
     """提取 PDF 指定页的嵌入图，返回 [{page, width, height, data_uri}]；页码无效或无图则跳过。"""
     out: list[dict] = []
@@ -43,10 +90,7 @@ def extract_page_images(path: Path | str, pages: list[int], max_per_page: int = 
             if not (1 <= page_number <= doc.page_count):
                 continue
             page = doc[page_number - 1]
-            for img in list(page.get_images())[:max_per_page]:
-                xref, width, height = img[0], img[2], img[3]
-                if width < 40 or height < 40:  # 与 captioning 同源阈值，跳过图标
-                    continue
+            for _index, xref, _width, _height in _eligible_page_images(page, max_per_page):
                 pix = pymupdf.Pixmap(doc, xref)
                 if pix.colorspace and pix.colorspace.n > 3:  # CMYK 等转 RGB
                     pix = pymupdf.Pixmap(pymupdf.csRGB, pix)

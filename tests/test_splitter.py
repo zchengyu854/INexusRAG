@@ -113,6 +113,29 @@ if True:
         self.assertEqual(figures[0].metadata["page"], 1)
         self.assertIn("第1页（图片）", figures[0].text)
 
+    def test_list_and_extract_page_image_share_index(self):
+        from src.ingestion.loaders import extract_page_image_png, list_page_images
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fig.pdf"
+            document = pymupdf.open()
+            page = document.new_page()
+            page.insert_image(
+                pymupdf.Rect(72, 100, 300, 260),
+                pixmap=pymupdf.Pixmap(pymupdf.csGRAY, pymupdf.IRect(0, 0, 200, 150)),
+            )
+            document.save(path)
+            document.close()
+
+            listed = list_page_images(path, [1])
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["page"], 1)
+            self.assertEqual(listed[0]["index"], 0)
+            png = extract_page_image_png(path, listed[0]["page"], listed[0]["index"])
+            self.assertIsNotNone(png)
+            self.assertGreater(len(png), 20)
+            self.assertIsNone(extract_page_image_png(path, 1, 9))
+
     def test_overlap_and_short_tail_never_exceed_limit(self):
         text = "# Notes\n\n" + "Sentence one. Sentence two. Sentence three. " * 8
         chunks = split_text(text, chunk_size=80, chunk_overlap=12)
