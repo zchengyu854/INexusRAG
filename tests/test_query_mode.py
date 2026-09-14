@@ -4,7 +4,7 @@ import unittest
 
 from unittest.mock import MagicMock, patch
 
-from src.api.routes import query
+from src.api.routes import _query_sync as query
 from src.api.schemas import QueryRequest
 
 
@@ -21,6 +21,19 @@ def chunk(chunk_id="a", score=0.9):
 
 
 class QueryModeTests(unittest.TestCase):
+    def test_features_cap_matches_feature_name_count(self):
+        """全选 8 个特性不应被 422 拒掉：features 上限必须与 FeatureName 选项数同步。
+
+        回归背景：新增 rewrite 后选项变 8 个，max_length 仍写 7，前端全选触发 HTTP 422。
+        """
+        from src.retrieval import ALL_FEATURES
+
+        all_features = sorted(ALL_FEATURES)
+        req = QueryRequest(question="问题", features=all_features)  # 不抛 = 通过校验
+        self.assertEqual(sorted(req.features), all_features)
+        # 常量上限与选项数严格一致，防止下次加特性再脱节
+        self.assertEqual(len(all_features), 8)
+
     def _env(self, mqs_return, agent_return):
         """把 /api/query 的外部依赖全部打桩，只观察分流行为。"""
         return [
