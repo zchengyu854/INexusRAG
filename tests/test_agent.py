@@ -211,6 +211,57 @@ class RunAgentTests(unittest.TestCase):
             out = run_agent("问题")
         self.assertEqual(out["trace"]["termination"], "answered")
 
+    def test_degrade_reason_when_llm_disabled(self):
+        degrade: dict = {}
+        with patch("src.llm.client.get_llm", return_value=FakeLLM(enabled=False)):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("LLM 未配置", degrade["reason"])
+
+    def test_degrade_reason_when_model_converges_without_searching(self):
+        """模型一步就选 answer：根本没检索过，不是「检索没命中」。"""
+        degrade: dict = {}
+        with patch("src.llm.client.get_llm", return_value=FakeLLM(actions=[])):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("一步即收敛", degrade["reason"])
+
+    def test_degrade_reason_when_first_llm_call_fails(self):
+        """第一步 LLM 调用就挂：没有任何证据可收敛，原因里要带出真实错误。"""
+        degrade: dict = {}
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}], raise_at=1)
+        with _enter(_patches(llm)):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("调用大模型失败", degrade["reason"])
+        self.assertIn("LLM 网关超时", degrade["reason"])
+
+    def test_degrade_reason_when_searches_hit_nothing(self):
+        """检索过但没命中 → 与「一步即收敛」区分开。"""
+        degrade: dict = {}
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        with _enter(_patches(llm, tss=lambda *a, **k: [])):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("未命中任何证据", degrade["reason"])
+
+    def test_degrade_reason_when_all_tools_fail(self):
+        degrade: dict = {}
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        with _enter(_patches(llm, tss=[RuntimeError("向量库超时")])):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("检索工具全部失败", degrade["reason"])
+        self.assertIn("向量库超时", degrade["reason"])
+
+    def test_degrade_sink_stays_empty_on_success(self):
+        degrade: dict = {}
+        llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])
+        with _enter(_patches(llm, tss=lambda *a, **k: [row("a", 0.9)])):
+            out = run_agent("问题", degrade=degrade)
+        self.assertIsNotNone(out)
+        self.assertEqual(degrade, {})
+
     def test_rerank_reorders_final_evidence_when_feature_enabled(self):
         """features 含 rerank：整个循环结束后对累积证据池做一次终排，trace 记录策略。"""
         llm = FakeLLM(actions=[{"thought": "", "tool": "search_knowledge", "args": {"query": "q1"}}])

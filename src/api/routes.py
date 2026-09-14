@@ -411,8 +411,12 @@ async def clear_conversation(conversation_id: str):
 def _run_agent_or_none(
     request: QueryRequest,
     on_step: Callable[[dict], None] | None = None,
+    degrade: dict | None = None,
 ) -> dict | None:
-    """Agentic 检索；任何异常都静默返回 None，由调用方退回单轮管线（绝不整体失败）。"""
+    """Agentic 检索；任何异常都静默返回 None，由调用方退回单轮管线（绝不整体失败）。
+
+    degrade 为可选出参：降级时写入 {"reason": "..."}，让界面能说清原因而不是给一串猜测。
+    """
     try:
         from src.agent import run_agent
 
@@ -424,8 +428,11 @@ def _run_agent_or_none(
             features=request.features,
             rerank_strategy=request.rerank_strategy,
             on_step=on_step,
+            degrade=degrade,
         )
-    except Exception:  # agentic 只是锦上添花，出错必须能安静退回已验证的单轮管线
+    except Exception as exc:  # agentic 只是锦上添花，出错必须能安静退回已验证的单轮管线
+        if degrade is not None:
+            degrade["reason"] = f"Agent 执行异常：{type(exc).__name__}: {exc}"
         return None
 
 
@@ -490,12 +497,20 @@ def _run_query(
     results: list[dict] = []
     trace_data: dict | None = None
     agent_trace: dict | None = None
+    agent_degrade_reason: str | None = None
 
     if request.mode == "agent":
         _emit("stage", {"stage": "agent", "detail": "自主多轮检索"})
-        outcome = _run_agent_or_none(request, on_step=lambda rec: _emit("agent_step", rec))
+        degrade: dict = {}
+        outcome = _run_agent_or_none(
+            request,
+            on_step=lambda rec: _emit("agent_step", rec),
+            degrade=degrade,
+        )
         if outcome is not None:
             results, agent_trace = outcome["results"], outcome["trace"]
+        else:
+            agent_degrade_reason = degrade.get("reason")
 
     if not results:  # pipeline 模式，或 agent 未产出（静默降级）
         _emit("stage", {"stage": "retrieve", "detail": "检索知识库"})
@@ -576,6 +591,9 @@ def _run_query(
         trace = QueryTrace(**trace_data)
         if agent_trace is not None:
             trace.agent = AgentTrace(**agent_trace)
+        elif agent_degrade_reason is not None:
+            # mode=agent 但没产出轨迹：把降级原因一并回传，界面不必再猜
+            trace.agent_degraded_reason = agent_degrade_reason
 
     response = QueryResponse(
         answer=answer,

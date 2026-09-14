@@ -99,7 +99,10 @@ export function RetrievalInspector({
             {degraded ? (
               <PanelSection label="模式提示">
                 <p className="rounded-md bg-warning/10 px-2 py-1.5 text-meta leading-snug text-warning">
-                  请求了 Agent，但本轮没有返回 Agent 轨迹，已静默降级为管线模式（回答形态一致）。常见原因：LLM 未配置、Agent 中途报错、或没拿到任何证据。
+                  请求了 Agent，但本轮没有返回 Agent 轨迹，已静默降级为管线模式（回答形态一致）。
+                  {trace?.agent_degraded_reason
+                    ? `原因：${trace.agent_degraded_reason}`
+                    : "常见原因：LLM 未配置、Agent 中途报错、或没拿到任何证据。"}
                 </p>
               </PanelSection>
             ) : null}

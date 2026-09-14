@@ -155,6 +155,8 @@ class QueryTrace(BaseModel):
     fusion: TraceFusion = Field(default_factory=TraceFusion)
     timings: TraceTimings = Field(default_factory=TraceTimings)
     agent: "AgentTrace | None" = None  # 仅 mode=agent 且未降级时非空
+    # 请求了 agent 但降级为管线时的原因（LLM 失败 / 无证据 / 一步收敛 …）；未降级时为 None
+    agent_degraded_reason: str | None = None
 
 
 class QueryResponse(BaseModel):

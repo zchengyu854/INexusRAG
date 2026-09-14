@@ -277,6 +277,29 @@ def _trace_step(step: int, thought: str | None, tool: str, args: dict) -> dict:
     }
 
 
+def _degrade_reason(termination: str, steps: list[dict]) -> str:
+    """把「为什么没产出结果」翻译成一句可读原因，供检视面板直接展示。
+
+    此前 run_agent 只返回 None，调用方与界面都无从判断降级原因：同样的提示文案背后
+    可能是 LLM 挂了、模型一步就收敛、或检索确实没命中，排查只能靠手工重放。
+
+    注意 termination 为 answered 时有两种截然不同的情况：模型一步就收敛（根本没检索），
+    与「检索过但没命中」。因此要看实际步骤里有没有检索动作，不能只看终止原因。
+    """
+    if termination == "error":
+        last_error = (steps[-1].get("args") or {}).get("error") if steps else None
+        return f"Agent 调用大模型失败：{last_error}" if last_error else "Agent 调用大模型失败"
+    searches = [step for step in steps if step.get("tool") not in (None, "answer")]
+    if not searches:
+        return "大模型一步即收敛，未收集到任何证据"
+    failures = [step["error"] for step in searches if step.get("error")]
+    if failures and len(failures) == len(searches):
+        return f"检索工具全部失败：{failures[0]}"
+    if failures:
+        return f"部分检索失败且未命中证据：{failures[0]}"
+    return "检索未命中任何证据（知识库可能缺少相关内容）"
+
+
 def run_agent(
     question: str,
     top_k: int = 5,
@@ -287,12 +310,17 @@ def run_agent(
     max_seconds: float = 45.0,
     rerank_strategy: str | None = None,
     on_step: Callable[[dict], None] | None = None,
+    degrade: dict | None = None,
 ) -> dict | None:
     """Agentic 检索：自主多轮，最多 max_steps 步。
 
     返回 {"results": [...], "trace": {...}}；**任一致命失败或无证据一律返回 None**，
     由调用方退回 multi_query_search。不在此处生成回答——生成统一由 routes 负责，
     这样 [Source N] 引用、figures、落库、history 处理只有一份逻辑。
+
+    degrade 为可选出参：返回 None 时写入 {"reason": "..."}，说明降级原因（界面据此
+    给出具体提示，而不是"常见原因有几种"）。与 retrieval.two_stage_search 的 stats
+    出参同一套路，不传时行为与改动前完全一致。
 
     rerank：features 显式包含 "rerank" 时，对整个循环累积的证据池做一次终排
     （只在收尾排一次，不是每步都排，避免重排开销乘以步数）。features=None 保持
@@ -305,6 +333,8 @@ def run_agent(
 
     llm = get_llm()
     if not llm.enabled:
+        if degrade is not None:
+            degrade["reason"] = "LLM 未配置：缺少可用的 API Key 或 provider"
         return None
 
     tool_names = _active_tools(features)
@@ -387,6 +417,8 @@ def run_agent(
             # 重排失败不致命：退回 RRF 序，agent 整体仍静默降级
             results = scratch.ranked(top_k)
     if not results:
+        if degrade is not None:
+            degrade["reason"] = _degrade_reason(termination, steps)
         return None
     return {
         "results": results,

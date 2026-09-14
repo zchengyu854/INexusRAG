@@ -198,6 +198,8 @@ export interface QueryTrace {
   fusion: TraceFusion
   timings: TraceTimings
   agent?: AgentTrace | null // 仅 mode=agent 且未降级时非空
+  /** 请求了 agent 却降级为管线时的原因；未降级为 null/undefined。 */
+  agent_degraded_reason?: string | null
 }
 
 // ---- 健康状态 ----

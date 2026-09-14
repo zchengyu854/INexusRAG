@@ -127,7 +127,12 @@ export function MessageThread({
 
               {meta || hasTrace ? (
                 <div className="flex items-center justify-between gap-2 border-t border-border pt-1.5">
-                  <span className="min-w-0 truncate font-mono text-meta text-muted-foreground">{meta ?? ""}</span>
+                  <span
+                    className="min-w-0 truncate font-mono text-meta text-muted-foreground"
+                    title={message.trace?.agent_degraded_reason ?? undefined}
+                  >
+                    {meta ?? ""}
+                  </span>
                   {hasTrace ? (
                     <button
                       type="button"

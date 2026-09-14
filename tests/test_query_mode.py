@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from src.api.routes import _query_sync as query
+from src.api.routes import _run_agent_or_none
 from src.api.schemas import QueryRequest
 
 
@@ -66,6 +67,7 @@ class QueryModeTests(unittest.TestCase):
         mqs.assert_not_called()
         self.assertIsNotNone(resp.trace.agent)
         self.assertEqual(resp.trace.agent.termination, "answered")
+        self.assertIsNone(resp.trace.agent_degraded_reason)  # 成功时不该有降级原因
 
     def test_agent_failure_falls_back_to_pipeline_silently(self):
         """agent 返回 None（不可用/无证据/异常）→ 静默退回单轮，响应形态不变。"""
@@ -77,6 +79,39 @@ class QueryModeTests(unittest.TestCase):
         agent.assert_called_once()
         mqs.assert_called_once()  # 退回了单轮
         self.assertEqual(len(resp.sources), 1)
+
+    def test_agent_degrade_reason_is_surfaced_in_trace(self):
+        """降级原因要透传到 trace，界面才能说清「为什么没走 Agent」。"""
+        req = QueryRequest(question="问题", mode="agent", debug=True)
+
+        def fake_agent(request, on_step=None, degrade=None):
+            if degrade is not None:
+                degrade["reason"] = "Agent 调用大模型失败：429 Too Many Requests"
+            return None
+
+        patches = [
+            patch("src.api.routes.database_stats", return_value={"total_chunks": 10}),
+            patch("src.api.routes.get_messages", return_value=[]),
+            patch("src.api.routes.save_message", return_value=None),
+            patch("src.api.routes.get_llm", return_value=MagicMock(generate=lambda *a, **k: "答案")),
+            patch("src.api.routes.multi_query_search", return_value=[chunk()]),
+            patch("src.api.routes._run_agent_or_none", side_effect=fake_agent),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            resp = query(req)
+        self.assertIsNone(resp.trace.agent)
+        self.assertEqual(resp.trace.agent_degraded_reason, "Agent 调用大模型失败：429 Too Many Requests")
+
+    def test_run_agent_exception_is_reported_in_degrade_sink(self):
+        """run_agent 抛异常时也不能吞掉原因：_run_agent_or_none 要写进 degrade。"""
+        req = QueryRequest(question="问题", mode="agent")
+        degrade: dict = {}
+        with patch("src.agent.run_agent", side_effect=RuntimeError("boom")):
+            out = _run_agent_or_none(req, degrade=degrade)
+        self.assertIsNone(out)
+        self.assertIn("boom", degrade["reason"])
 
     def test_pipeline_trace_has_no_agent_field(self):
         req = QueryRequest(question="问题", debug=True)
