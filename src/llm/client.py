@@ -34,6 +34,18 @@ def _is_transient(exc: Exception) -> bool:
     return isinstance(status, int) and (status == 429 or status >= 500)
 
 
+def _tool_choice_unsupported(exc: Exception) -> bool:
+    """识别「模型不支持强制 tool_choice」这类 400。
+
+    实测 deepseek 的 thinking 模式会直接拒绝：
+    `400 Thinking mode does not support this tool_choice`。
+    这类模型仍能以「给 tools 但由模型自行决定是否调用」的方式工作，
+    所以要退化为非强制模式，而不是让整个特性静默失效。
+    """
+    status = getattr(exc, "status_code", None)
+    return status == 400 and "tool_choice" in str(exc).lower()
+
+
 _GENERATE_SYSTEM_PROMPT = (
     "你是 NexusRAG，基于用户已入库文档的问答助手。"
     "只根据本次检索到的资料和对话上下文回答，不编造。\n\n"
@@ -182,21 +194,37 @@ class LLMClient:
         tool: dict,
         history: list[dict] | None = None,
     ) -> dict:
-        """Function-calling 结构化输出：强制调用 tool 并返回解析后的 JSON 参数。"""
+        """Function-calling 结构化输出：让模型调用 tool 并返回解析后的 JSON 参数。
+
+        优先用 tool_choice 强制调用（结构化输出最稳）；但部分模型（deepseek 的
+        thinking 模式）不支持强制指定，会回 400。这时退化为「只给 tools、由模型自行
+        决定是否调用」——否则 plan_question 这类依赖会静默拿不到结构化结果。
+        """
         messages = [{"role": "user", "content": prompt}]
         messages.extend(
             {"role": m["role"], "content": m["content"]}
             for m in (history or [])
             if m["role"] in {"user", "assistant"}
         )
-        response = self._create_with_retry(
-            model=self.model,
-            temperature=0,
-            messages=messages,
-            tools=[{"type": "function", "function": tool}],
-            # 对象形式：部分网关（OpenAI 兼容）不接受字符串简写
-            tool_choice={"type": "function", "function": {"name": tool["name"]}},
-        )
+        tools = [{"type": "function", "function": tool}]
+        try:
+            response = self._create_with_retry(
+                model=self.model,
+                temperature=0,
+                messages=messages,
+                tools=tools,
+                # 对象形式：部分网关（OpenAI 兼容）不接受字符串简写
+                tool_choice={"type": "function", "function": {"name": tool["name"]}},
+            )
+        except Exception as exc:
+            if not _tool_choice_unsupported(exc):
+                raise
+            response = self._create_with_retry(
+                model=self.model,
+                temperature=0,
+                messages=messages,
+                tools=tools,
+            )
         tool_calls = response.choices[0].message.tool_calls
         if not tool_calls:
             raise ValueError("模型未按 function calling 格式返回")

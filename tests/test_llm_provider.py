@@ -107,5 +107,65 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(client._client.chat.completions.create.call_count, 2)
 
 
+class FakeBadRequest(Exception):
+    """模拟网关的 400；消息里带 tool_choice 才算「不支持强制调用」。"""
+
+    def __init__(self, message: str = "Thinking mode does not support this tool_choice"):
+        super().__init__(message)
+        self.status_code = 400
+
+
+class ToolChoiceFallbackTests(unittest.TestCase):
+    """deepseek 的 thinking 模式拒绝强制 tool_choice，必须退化为非强制调用。"""
+
+    def _tool_response(self, arguments: str):
+        fn = MagicMock()
+        fn.arguments = arguments
+        msg = MagicMock()
+        msg.tool_calls = [MagicMock()]
+        msg.tool_calls[0].function = fn
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message = msg
+        return resp
+
+    def _client(self, effects):
+        client = LLMClient(api_key="k", model="deepseek-flash")
+        client._client = MagicMock()
+        client._client.chat.completions.create.side_effect = effects
+        return client
+
+    def test_falls_back_to_unforced_tool_call(self):
+        ok = self._tool_response('{"subs": ["子问题"], "step_back": null, "hyde": null}')
+        client = self._client([FakeBadRequest(), ok])
+        tool = {"name": "plan_question", "description": "d", "parameters": {"type": "object"}}
+        with patch("src.llm.client.time.sleep"):
+            out = client.tool_call("问题", tool)
+        self.assertEqual(out["subs"], ["子问题"])
+        self.assertEqual(client._client.chat.completions.create.call_count, 2)
+        # 第一次带 tool_choice、第二次不带
+        first, second = client._client.chat.completions.create.call_args_list
+        self.assertIn("tool_choice", first.kwargs)
+        self.assertNotIn("tool_choice", second.kwargs)
+
+    def test_unrelated_bad_request_still_raises(self):
+        client = self._client([FakeBadRequest("Invalid model")])
+        tool = {"name": "plan_question", "description": "d", "parameters": {"type": "object"}}
+        with self.assertRaises(FakeBadRequest):
+            client.tool_call("问题", tool)
+        self.assertEqual(client._client.chat.completions.create.call_count, 1)
+
+    def test_missing_tool_call_raises_value_error(self):
+        msg = MagicMock()
+        msg.tool_calls = None
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message = msg
+        client = self._client([FakeBadRequest(), resp])
+        tool = {"name": "plan_question", "description": "d", "parameters": {"type": "object"}}
+        with self.assertRaises(ValueError):
+            client.tool_call("问题", tool)
+
+
 if __name__ == "__main__":
     unittest.main()
