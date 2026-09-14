@@ -22,6 +22,7 @@ from src.storage.database import (
     graph_stats,
     link_chunk_entities,
     list_documents,
+    mark_chunk_graph_done,
     reset_graph,
     search_entities,
     upsert_entity,
@@ -218,16 +219,15 @@ def build_document(doc_id: str, resume: bool = True) -> int:
         batch = chunks[start:start + _EXTRACT_BATCH]
         with ThreadPoolExecutor(max_workers=_EXTRACT_WORKERS) as pool:
             extracted = list(pool.map(lambda c: (c, extract_graph(c["text"])), batch))
-        for chunk, graph_data in extracted:
-            _store_chunk(chunk, graph_data, embedder)
-            processed += 1
-        # 整批全空几乎只可能是限流/故障；不能静默写出一张空图（否则 12 分钟的构建
-        # “成功”但产物无意义，且消融会得出“图检索没用”的假结论）
+        # 整批全空几乎只可能是限流/故障；先判失败再落库，避免把空结果标成 done。
         if extracted and not any(g["entities"] for _, g in extracted):
             raise RuntimeError(
                 f"连续 {len(extracted)} 块抽取均为空，判定为 LLM 限流/故障（非文本本身无实体）。"
                 "已保留此前批次的进度，稍后用 --resume 续跑。"
             )
+        for chunk, graph_data in extracted:
+            _store_chunk(chunk, graph_data, embedder)
+            processed += 1
     return processed
 
 
@@ -245,7 +245,10 @@ def _store_chunk(chunk: dict, graph_data: dict, embedder) -> None:
         src_id, dst_id = idmap.get(rel["src"]), idmap.get(rel["dst"])
         if src_id and dst_id:
             add_relation(src_id, dst_id, rel["rel"], norm_relation(rel["rel"]), chunk["chunk_id"])
-    link_chunk_entities(chunk["chunk_id"], list(idmap.values()))
+    entity_ids = list(idmap.values())
+    link_chunk_entities(chunk["chunk_id"], entity_ids)
+    # 含 0 实体也打标，resume 不再重抽空块（目录/参考文献等）
+    mark_chunk_graph_done(chunk["chunk_id"], entity_count=len(entity_ids))
 
 
 def build(doc_names: list[str] | None = None, resume: bool = False) -> dict:

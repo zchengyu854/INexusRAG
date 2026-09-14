@@ -195,7 +195,8 @@ class BuildDocumentTests(unittest.TestCase):
              patch.object(graph, "upsert_entity", side_effect=["e-1", "e-2"]), \
              patch.object(graph, "get_embedder", return_value=_FakeEmbedder()), \
              patch.object(graph, "add_relation") as add_relation, \
-             patch.object(graph, "link_chunk_entities") as link:
+             patch.object(graph, "link_chunk_entities") as link, \
+             patch.object(graph, "mark_chunk_graph_done") as mark_done:
             processed = build_document("doc-1", resume=False)
         self.assertEqual(processed, 1)
         link.assert_called_once()
@@ -204,6 +205,7 @@ class BuildDocumentTests(unittest.TestCase):
         self.assertEqual(sorted(linked_ids), ["e-1", "e-2"])
         # 关系两端都解析成了实体 id
         self.assertEqual(add_relation.call_args[0][:2], ("e-1", "e-2"))
+        mark_done.assert_called_once_with("chunk-1", entity_count=2)
 
     def test_blank_chunks_are_skipped(self):
         chunks = [{"chunk_id": "c-1", "chunk_index": 0, "text": "   "},
@@ -227,15 +229,42 @@ class BuildDocumentTests(unittest.TestCase):
         self.assertEqual(processed, 1)
         self.assertEqual(extract.call_count, 1)
 
-    def test_all_empty_batch_raises_instead_of_writing_empty_graph(self):
-        # 限流/故障时不能静默产出一张空图：构建要响亮地失败
+    def test_all_empty_batch_raises_without_storing(self):
+        # 限流/故障时不能静默产出一张空图：构建要响亮地失败，且不能标 done
         chunks = [{"chunk_id": f"c-{i}", "chunk_index": i, "text": "正文"} for i in range(3)]
         with patch.object(graph, "get_chunks_for_graph", return_value=chunks), \
-             patch.object(graph, "_store_chunk"), \
+             patch.object(graph, "_store_chunk") as store, \
              patch.object(graph, "extract_graph", return_value=_EMPTY), \
              patch.object(graph, "get_embedder", return_value=_FakeEmbedder()):
             with self.assertRaises(RuntimeError):
                 build_document("doc-1", resume=False)
+        store.assert_not_called()
+
+    def test_mixed_batch_marks_empty_chunk_done(self):
+        chunks = [
+            {"chunk_id": "c-empty", "chunk_index": 0, "text": "目录"},
+            {"chunk_id": "c-hit", "chunk_index": 1, "text": "正文"},
+        ]
+
+        def fake_extract(text):
+            return _EMPTY if text == "目录" else _ONE_ENTITY
+
+        with patch.object(graph, "get_chunks_for_graph", return_value=chunks), \
+             patch.object(graph, "extract_graph", side_effect=fake_extract), \
+             patch.object(graph, "get_entity_by_norm", return_value=None), \
+             patch.object(graph, "search_entities", return_value=[]), \
+             patch.object(graph, "upsert_entity", return_value="e-1"), \
+             patch.object(graph, "get_embedder", return_value=_FakeEmbedder()), \
+             patch.object(graph, "add_relation"), \
+             patch.object(graph, "link_chunk_entities"), \
+             patch.object(graph, "mark_chunk_graph_done") as mark_done:
+            processed = build_document("doc-1", resume=False)
+        self.assertEqual(processed, 2)
+        # 空抽取也打标，避免 resume 反复烧钱
+        self.assertEqual(
+            [(c.args[0], c.kwargs.get("entity_count")) for c in mark_done.call_args_list],
+            [("c-empty", 0), ("c-hit", 1)],
+        )
 
 
 if __name__ == "__main__":
