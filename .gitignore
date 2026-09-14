@@ -63,3 +63,6 @@ ui/web/node_modules/
 ui/web/.next/
 ui/web/.pnp.*
 models/
+
+# Personal notes (interview prep, not project content)
+docs/project-storyline.md

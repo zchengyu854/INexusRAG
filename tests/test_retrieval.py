@@ -4,7 +4,10 @@ import unittest
 from unittest.mock import patch
 
 from src.retrieval import (
+    ALL_FEATURES,
+    _DEFAULT_FEATURES,
     _extract_article_terms,
+    _gate_keyword_rows,
     _relevance_filter,
     build_routing_summary,
     expand_terms,
@@ -195,6 +198,84 @@ class RetrievalTests(unittest.TestCase):
     def test_top_k_truncates(self):
         self.assertEqual(len(rrf_merge([[row(str(i)) for i in range(20)]], top_k=5)), 5)
 
+    def test_keyword_hits_do_not_fake_vector_score(self):
+        """关键词通道的 score 是命中词数（≥1），不是余弦：未打标的行融合后必须记 0.0。
+
+        修复前 rrf_merge 用 score 兜底 vector_score，关键词行会带着 1.0~3.0 的
+        假余弦进入 _relevance_filter，把「无精确匹配即清空」的阈值闸门永远撑开。
+        """
+        kw = [{"chunk_id": "k1", "text": "x", "score": 2.0}]
+        merged = rrf_merge([kw], top_k=5)
+        self.assertEqual(merged[0]["vector_score"], 0.0)
+
+    def test_keyword_noise_cannot_defeat_relevance_gate(self):
+        """端到端口径：无精确匹配且真实余弦不足时，关键词弱命中必须被闸门清空。"""
+        results = rrf_merge([[
+            {"chunk_id": "kw", "text": "只提到一个词的切片", "score": 1.0},
+            {"chunk_id": "noise", "text": "完全无关的内容", "score": 1.0},
+        ]], top_k=5)
+        self.assertEqual(_relevance_filter(results, "民法典的继承规则是什么"), [])
+
+    _FAKE_GROUPS = {
+        "甲": ("甲", "A"), "乙": ("乙", "B"), "丙": ("丙", "C"), "丁": ("丁", "D"),
+    }
+
+    def _fake_synonym_group(self, term: str):
+        return self._FAKE_GROUPS.get(term, (term,))
+
+    def test_keyword_gate_drops_weak_hits_on_long_queries(self):
+        """≥3 组查询：只覆盖一半以下概念组的弱命中行必须被门控拦下。"""
+        rows = [
+            {"chunk_id": "strong", "text": "同时提到甲与乙的切片", "score": 2.0},
+            {"chunk_id": "weak", "text": "只提到甲的切片", "score": 1.0},
+        ]
+        with patch("src.retrieval.synonym_group", side_effect=self._fake_synonym_group):
+            kept = _gate_keyword_rows(rows, ["甲", "乙", "丙", "丁"])
+        self.assertEqual([r["chunk_id"] for r in kept], ["strong"])
+
+    def test_keyword_gate_counts_synonym_groups_not_raw_terms(self):
+        """同义词变体归并为一组：一词多变体命中不得虚增覆盖数。"""
+        rows = [{"chunk_id": "one", "text": "只覆盖甲（含变体 A）", "score": 2.0}]
+        with patch("src.retrieval.synonym_group", side_effect=self._fake_synonym_group):
+            # 甲/A 同组、乙/B 同组 → 扁平 4 词只有 2 组 → 门控不收紧
+            kept = _gate_keyword_rows(rows, ["甲", "A", "乙", "B"])
+        self.assertEqual([r["chunk_id"] for r in kept], ["one"])
+
+    def test_keyword_gate_noop_for_short_queries(self):
+        """组数 ≤2 时不收紧：单一精确串救援（如「第4页」）不因门控丢失。"""
+        rows = [{"chunk_id": "w", "text": "只提到甲", "score": 1.0}]
+        with patch("src.retrieval.synonym_group", side_effect=self._fake_synonym_group):
+            self.assertEqual(_gate_keyword_rows(rows, ["甲"]), rows)
+            self.assertEqual(_gate_keyword_rows(rows, ["甲", "乙"]), rows)
+            self.assertEqual(_gate_keyword_rows(rows, []), rows)
+
+    def test_two_stage_search_gates_weak_keyword_rows(self):
+        """通道级接线：弱命中行被门控清空后，融合结果只剩向量行。"""
+        with patch("src.retrieval.synonym_group", side_effect=self._fake_synonym_group), \
+             patch("src.retrieval.keyword_chunks", return_value=[
+                 {"chunk_id": "k1", "text": "只提到甲", "score": 1.0},
+             ]), \
+             patch("src.retrieval.search_chunks", return_value=[
+                 {"chunk_id": "v1", "text": "y", "score": 0.52},
+             ]), \
+             patch("src.retrieval.search_doc_index", return_value=[]):
+            merged = two_stage_search([0.0], top_k=5, terms=["甲", "乙", "丙", "丁"], use_routing=True)
+        self.assertEqual([r["chunk_id"] for r in merged], ["v1"])
+
+    def test_vector_channel_rows_carry_real_cosine(self):
+        """two_stage_search 出来的行：向量行带真实余弦，关键词行标 0.0。"""
+        with patch("src.retrieval.keyword_chunks", return_value=[
+            {"chunk_id": "k1", "text": "x", "score": 1.0},
+        ]), patch("src.retrieval.search_chunks", return_value=[
+            {"chunk_id": "v1", "text": "y", "score": 0.52},
+        ]), patch("src.retrieval.search_doc_index", return_value=[
+            {"doc_id": "d1", "score": 0.9},
+        ]):
+            merged = two_stage_search([0.0], top_k=5, terms=["x"], use_routing=True)
+        by_id = {r["chunk_id"]: r["vector_score"] for r in merged}
+        self.assertEqual(by_id["k1"], 0.0)
+        self.assertEqual(by_id["v1"], 0.52)
+
     def test_extract_terms_filters_junk_and_single_chars(self):
         terms = extract_terms("如何安装数据库")
         self.assertIn("安装", terms)
@@ -279,7 +360,10 @@ class RetrievalTests(unittest.TestCase):
              patch("src.retrieval.plan_question", return_value=plan), \
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs) * 3
-            results = multi_query_search("原始问题", top_k=2, filters={"page": 1})
+            results = multi_query_search(
+                "原始问题", top_k=2, filters={"page": 1},
+                features=["routing", "keywords", "decompose", "rewrite"],
+            )
 
         self.assertEqual(len(tss_mock.call_args_list), 4)  # 原问题 + 改写 + 两个子问题
         self.assertTrue(all(c.kwargs.get("filters") == {"page": 1} for c in tss_mock.call_args_list))
@@ -296,7 +380,10 @@ class RetrievalTests(unittest.TestCase):
              patch("src.retrieval.plan_question", return_value=plan), \
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
-            multi_query_search("原始问题", top_k=2)
+            multi_query_search(
+                "原始问题", top_k=2,
+                features=["routing", "keywords", "decompose", "stepback", "hyde", "rewrite"],
+            )
         # 原问题 + 改写 + 子问题 + 退步 + HyDE(纯向量, terms=[]) = 5 通道
         self.assertEqual(len(tss_mock.call_args_list), 5)
         self.assertEqual(tss_mock.call_args_list[4].kwargs["terms"], [])
@@ -306,7 +393,11 @@ class RetrievalTests(unittest.TestCase):
         plan = {"subs": [], "step_back": None, "hyde": None}
 
         def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
-            return [row("a", 0.9), row("b", 0.8)]
+            # two_stage_search 现契约：向量行自带真实余弦（vector_score），见 _stamp_cosine
+            return [
+                {"chunk_id": "a", "score": 0.9, "vector_score": 0.9},
+                {"chunk_id": "b", "score": 0.8, "vector_score": 0.8},
+            ]
 
         with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
              patch("src.retrieval.plan_question", return_value=plan), \
@@ -420,10 +511,13 @@ class RetrievalTests(unittest.TestCase):
              patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            # 门控：LLM 判定不需要分解/退步/HyDE，且 rewrite 默认关闭 → 仅原问题单通道
             multi_query_search("简单问题", top_k=2)
-        # 门控：LLM 判定不需要分解/退步/HyDE；但确定性 query 改写会把"简单问题"归一为"简单 问题"
-        # 作为额外通道并入 → 原问题 + 改写 = 2 通道（改写不依赖 LLM，永远在线）。
-        self.assertEqual(len(tss_mock.call_args_list), 2)
+            with patch("src.retrieval.two_stage_search", return_value=[]) as tss_kw:
+                multi_query_search("简单问题", top_k=2, features=list(_DEFAULT_FEATURES) + ["rewrite"])
+        self.assertEqual(len(tss_mock.call_args_list), 1)
+        # 显式开启 rewrite 时，确定性改写把"简单问题"归一为"简单 问题"并作为额外通道并入
+        self.assertEqual(len(tss_kw.call_args_list), 2)
 
     def test_rewrite_query_normalizes_question(self):
         """确定性改写：去后缀、归一法条、拼实体词；无实体时原样返回。"""
@@ -442,16 +536,24 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(len(tss.call_args_list), 1)
 
     def test_multi_query_search_rewrite_adds_channel_and_surfaces_in_trace(self):
-        """rewrite 默认开启：可改写查询会多一路通道，并在 debug trace 的 plan.rewritten 暴露。"""
+        """显式开启 rewrite：可改写查询会多一路通道，并在 debug trace 的 plan.rewritten 暴露。"""
         with patch("src.retrieval.two_stage_search", return_value=[]), \
              patch("src.retrieval.keyword_chunks", return_value=[]), \
              patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
-            out = multi_query_search("民法典的二百三十条是什么？", top_k=2, debug=True)
+            out = multi_query_search(
+                "民法典的二百三十条是什么？", top_k=2, debug=True,
+                features=["routing", "keywords", "rewrite"],
+            )
         self.assertIsNotNone(out["trace"]["plan"]["rewritten"])
         self.assertIn("第二百三十条", out["trace"]["plan"]["rewritten"])
         self.assertIn("rewrite", out["trace"]["applied"])
+
+    def test_rewrite_not_in_default_features(self):
+        """回归：rewrite 默认关闭（n=63 消融上三个子集 ΔMRR 全为负，见评测报告第九节）。"""
+        self.assertNotIn("rewrite", _DEFAULT_FEATURES)
+        self.assertIn("rewrite", ALL_FEATURES)  # 仍可显式开启
 
     def test_hyde_embedding_shares_encode_batch_with_queries(self):
         """HyDE 向量与问题向量一次 encode，避免多一次模型前向。"""
@@ -471,8 +573,10 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(len(captured[0]), 2)
 
     def test_graph_channel_is_invoked_with_primary_vector(self):
+        # 图谱行与现实一致：带正文文本（锚点实体所在切片），无 vector_score（非余弦信号）
+        graph_row = {"chunk_id": "g", "score": 0.9, "text": "问题涉及的核心实体内容"}
         with patch("src.retrieval.two_stage_search", return_value=[]), \
-             patch("src.graph.graph_channel", return_value=[row("g")]) as gc, \
+             patch("src.graph.graph_channel", return_value=[graph_row]) as gc, \
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.1, 0.2]] * len(qs)
             out = multi_query_search("问题", top_k=2, features=["graph"])

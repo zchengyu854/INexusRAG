@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -97,11 +98,66 @@ def search_terms(question: str) -> list[str]:
     return expand_terms(extract_terms(question))
 
 
+def _stamp_cosine(rows: list[dict]) -> list[dict]:
+    """向量通道行：search_chunks 的 score 即余弦，登记到 vector_score。"""
+    for r in rows:
+        r.setdefault("vector_score", float(r.get("score") or 0.0))
+    return rows
+
+
+def _stamp_non_vector(rows: list[dict]) -> list[dict]:
+    """非向量通道（关键词/图谱）行：score 是命中词数/跳数分，与余弦不同量纲，显式标 0.0。"""
+    for r in rows:
+        r.setdefault("vector_score", 0.0)
+    return rows
+
+
+# 关键词通道质量门控（2026-09-14，依据 n=63 逐例归因 scripts/analyze_keywords_channel.py）：
+# 关键词通道净负向（ΔMRR −0.117，逐例 25 变差 / 10 变好 / 28 不变）的主因是弱命中——
+# 长查询里只沾一个词的切片被 RRF 抬进前列。门控按「同义词组」计覆盖（与 _relevance_filter
+# 同口径，避免同义词扩展虚增/稀释命中数），要求至少覆盖一半概念组；组数 ≤2 时不收紧
+# （≥1 命中即保留，保住「第4页的插图」这类靠单一精确串救回的用例——它们另有
+# inject_ref_channel 兜底）。本门控不读 score（命中词数，非余弦量纲）；余弦下限由
+# _relevance_filter 在修复后的真 vector_score 上执行（仪器缺陷见 docs/eval-report-2026-09-14.md §9.0）。
+_KEYWORD_MIN_COVERAGE = 0.5
+
+
+def _gate_keyword_rows(rows: list[dict], terms: list[str]) -> list[dict]:
+    """关键词通道质量门控：按同义词组覆盖度过滤弱命中行。
+
+    terms 是 expand_terms 之后的扁平词表（含同义词变体），先归并为同义词组再计覆盖；
+    组数 ≤2 时原样返回（此时"至少命中一半"不构成有效约束，且会误伤单串救援）。
+    """
+    if not rows or not terms:
+        return rows
+    groups: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for t in terms:
+        g = synonym_group(t)
+        if g not in seen:
+            seen.add(g)
+            groups.append(g)
+    n = len(groups)
+    if n <= 2:
+        return rows
+    need = max(2, math.ceil(n * _KEYWORD_MIN_COVERAGE))
+    kept: list[dict] = []
+    for r in rows:
+        text = r.get("text", "")
+        covered = sum(1 for g in groups if any(v in text for v in g))
+        if covered >= need:
+            kept.append(r)
+    return kept
+
+
 def rrf_merge(channels: list[list[dict]], top_k: int, k: int = 60) -> list[dict]:
     """RRF 融合多个有序结果通道，返回带融合分的行（按 chunk_id 去重）。
 
     同时保留每个 chunk 的最佳向量余弦分（vector_score），供后续相关性阈值过滤使用。
-    关键词通道没有向量分（视为 0.0），靠精确命中保命。
+    vector_score 只认显式标注的余弦（_stamp_cosine / _stamp_non_vector 在通道入口标注），
+    绝不用 score 兜底：关键词的命中词数、图谱的跳数分都 ≥1，冒充余弦会把
+    _relevance_filter 的 0.45 阈值闸门永远撑开，「无精确匹配即清空」的防幻觉分支形同虚设。
+    关键词/图谱行没有余弦（记 0.0），靠精确命中保命。
     """
     scores: dict[str, float] = {}
     rows: dict[str, dict] = {}
@@ -111,10 +167,9 @@ def rrf_merge(channels: list[list[dict]], top_k: int, k: int = 60) -> list[dict]
             key = row["chunk_id"]
             rows.setdefault(key, row)
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
-            # vector_score 已存在则复用（来自 two_stage_search 的二次融合），否则取当前 score（cosine）
             vector_scores[key] = max(
                 vector_scores.get(key, 0.0),
-                row.get("vector_score") if row.get("vector_score") is not None else row.get("score", 0.0),
+                float(row.get("vector_score") or 0.0),
             )
     ranked = sorted(scores, key=scores.get, reverse=True)[:top_k]
     return [dict(rows[key], score=round(scores[key], 6), vector_score=round(vector_scores[key], 6)) for key in ranked]
@@ -328,11 +383,15 @@ def two_stage_search(
             stats[key] = stats.get(key, 0) + n
 
     if terms:
-        keyword_rows = keyword_chunks(terms, limit=limit, filters=filters)
+        keyword_rows = _stamp_non_vector(keyword_chunks(terms, limit=limit, filters=filters))
+        gated = len(keyword_rows)
+        keyword_rows = _gate_keyword_rows(keyword_rows, terms)
+        if stats is not None:
+            _bump("keywords_gated", gated - len(keyword_rows))
         _bump("keywords", len(keyword_rows))
         channels.append(keyword_rows)
     if not use_routing:
-        vector_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+        vector_rows = _stamp_cosine(search_chunks(query_embedding, top_k=limit, filters=filters))
         _bump("vector", len(vector_rows))
         channels.append(vector_rows)
         return rrf_merge(channels, top_k) if channels else []
@@ -353,12 +412,12 @@ def two_stage_search(
     if routed and top_score >= _MIN_ROUTE_SCORE:
         # 路由足够自信：只在命中文档内检索
         for row in routed:
-            doc_rows = search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters)
+            doc_rows = _stamp_cosine(search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters))
             _bump("vector", len(doc_rows))
             channels.append(doc_rows)
     else:
         # 无命中，或置信不足：全局向量一路即可（不再叠加常错的 per-doc 通道）
-        fallback_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+        fallback_rows = _stamp_cosine(search_chunks(query_embedding, top_k=limit, filters=filters))
         _bump("vector", len(fallback_rows))
         if stats is not None:
             if lock is not None:
@@ -423,7 +482,10 @@ def plan_question(question: str) -> dict:
 
 
 ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rewrite", "rerank", "graph")
-_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rewrite")  # rerank/graph 默认关，消融时显式传 features
+# rewrite 默认关：n=63 消融中三个子集（全量 / 人工 / 自动）上 ΔMRR 均为负（−0.082 / −0.006 / −0.093），
+# 且它每次查询都要多跑一路向量+关键词检索，属纯成本。需要时用 features 显式开启。
+# 详见 docs/eval-report-2026-09-14.md 第九节。rerank/graph 默认关，消融时显式传 features。
+_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")
 
 
 def multi_query_search(
@@ -511,7 +573,7 @@ def multi_query_search(
                 )
             channels = list(pool.map(_run_job, jobs))
             if graph_future is not None:
-                graph_rows = graph_future.result()
+                graph_rows = _stamp_non_vector(graph_future.result())
                 channels.append(graph_rows)
     hyde_rows: list[dict] = channels[len(queries)] if hyde_used else []
     t_retrieved = _time.perf_counter() if debug else 0.0
