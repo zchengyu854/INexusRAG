@@ -312,7 +312,15 @@ export async function fetchDocs(): Promise<Doc[]> {
   return res.json()
 }
 
-export async function uploadFile(file: File): Promise<{ id: string; filename: string; status: string }> {
+export async function uploadFile(file: File): Promise<{
+  id: string
+  filename: string
+  status: string
+  /** true = 库中已有相同内容的文档，已幂等返回它，无需再调 ingest */
+  duplicate?: boolean
+  /** true = 命中此前软删除的同一内容，已复用原文档行并重新入库 */
+  restored?: boolean
+}> {
   const formData = new FormData()
   formData.append("file", file)
   const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: formData })

@@ -194,8 +194,12 @@ def ensure_database() -> None:
                 config JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 error TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                -- 软删除时间；非空表示已删除，不再出现在列表/统计里，检索索引也已回收
+                deleted_at TIMESTAMPTZ
             );
+            -- 存量库补列（CREATE TABLE IF NOT EXISTS 不会给已有表加列）
+            ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
             CREATE TABLE IF NOT EXISTS chunks (
                 id UUID PRIMARY KEY,
                 document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -301,11 +305,60 @@ def vector_literal(values: list[float]) -> str:
     return "[" + ",".join(str(float(value)) for value in values) + "]"
 
 
-def create_document(doc_id: str, filename: str, source_path: str) -> None:
+def create_document(doc_id: str, filename: str, source_path: str, source_sha256: str | None = None) -> None:
     with connection() as conn:
         conn.execute(
-            "INSERT INTO documents (id, filename, source_path) VALUES (%s, %s, %s)",
-            (doc_id, filename, source_path),
+            "INSERT INTO documents (id, filename, source_path, source_sha256) VALUES (%s, %s, %s, %s)",
+            (doc_id, filename, source_path, source_sha256),
+        )
+
+
+def find_document_by_hash(source_sha256: str) -> dict | None:
+    """按内容哈希找文档（含已软删除的），用于上传去重与「重传即恢复」。
+
+    同一内容只应入库一次：重复上传直接返回既有文档，避免同名文档并存、
+    检索结果里同一篇资料出现两遍。取最新一条，因为恢复走的也是同一行。
+    """
+    if not source_sha256:
+        return None
+    with connection() as conn:
+        return conn.execute(
+            "SELECT * FROM documents WHERE source_sha256 = %s ORDER BY created_at DESC LIMIT 1",
+            (source_sha256,),
+        ).fetchone()
+
+
+def documents_missing_hash() -> list[dict]:
+    """列出还没写内容哈希的文档，供一次性回填。
+
+    加哈希去重之前入库的文档 source_sha256 为空，必须回填，否则「重传同一份文件」
+    仍然会被当成新内容再入一遍。
+    """
+    with connection() as conn:
+        return list(conn.execute(
+            "SELECT id, filename, source_path FROM documents WHERE source_sha256 IS NULL AND deleted_at IS NULL"
+        ))
+
+
+def set_document_hash(doc_id: str, source_sha256: str) -> None:
+    with connection() as conn:
+        conn.execute(
+            "UPDATE documents SET source_sha256 = %s WHERE id = %s",
+            (source_sha256, doc_id),
+        )
+
+
+def restore_document(doc_id: str, source_path: str) -> None:
+    """把软删除的文档恢复成待入库状态（源文件仍在磁盘上，重新切分嵌入即可）。"""
+    with connection() as conn:
+        conn.execute(
+            """
+            UPDATE documents
+               SET deleted_at = NULL, source_path = %s, status = 'indexing',
+                   chunks = 0, error = NULL, updated_at = now()
+             WHERE id = %s
+            """,
+            (source_path, doc_id),
         )
 
 
@@ -316,7 +369,9 @@ def get_document(doc_id: str) -> dict | None:
 
 def list_documents() -> list[dict]:
     with connection() as conn:
-        return list(conn.execute("SELECT * FROM documents ORDER BY created_at DESC"))
+        return list(conn.execute(
+            "SELECT * FROM documents WHERE deleted_at IS NULL ORDER BY created_at DESC"
+        ))
 
 
 def update_document(doc_id: str, **fields: object) -> None:
@@ -337,9 +392,47 @@ def update_document(doc_id: str, **fields: object) -> None:
 
 
 def delete_document(doc_id: str) -> int:
+    """软删除：保留文档行与磁盘原文，立即回收检索用的衍生数据。
+
+    衍生数据（切片 / 实体链接 / 路由摘要）都是派生物，恢复时重新入库即可重建，
+    所以这里直接清掉——既保证已删文档不会再被检索命中，也避免给每条检索通道
+    都加一层「文档未删除」的过滤条件。返回受影响行数（0 表示文档不存在或已删除）。
+    """
     with connection() as conn:
-        result = conn.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+        result = conn.execute(
+            """
+            UPDATE documents
+               SET deleted_at = now(), chunks = 0, updated_at = now()
+             WHERE id = %s AND deleted_at IS NULL
+            """,
+            (doc_id,),
+        )
+        conn.execute("DELETE FROM chunks WHERE document_id = %s", (doc_id,))
+        conn.execute("DELETE FROM doc_index WHERE doc_id = %s", (doc_id,))
         return result.rowcount
+
+
+def purge_deleted_documents(older_than_days: int = 0) -> list[dict]:
+    """物理清理软删除超过 N 天的文档，返回被清理的 [{id, filename, source_path}]。
+
+    调用方负责删除返回列表里对应的磁盘文件——数据库只管元数据，
+    文件系统操作留给脚本，避免长事务里做 IO。
+    """
+    with connection() as conn:
+        rows = list(conn.execute(
+            """
+            SELECT id, filename, source_path FROM documents
+             WHERE deleted_at IS NOT NULL
+               AND deleted_at <= now() - make_interval(days => %s)
+            """,
+            (max(0, older_than_days),),
+        ))
+        if rows:
+            conn.execute(
+                "DELETE FROM documents WHERE id = ANY(%s)",
+                [[row["id"] for row in rows]],
+            )
+        return rows
 
 
 _CHUNK_INSERT_BATCH = 500  # 7 参数/行；PG 上限 65535，500 行远低于上限且语句更稳
@@ -945,5 +1038,7 @@ def stats() -> dict:
         row = conn.execute(
             "SELECT count(*)::int AS total_chunks, COALESCE(sum(octet_length(text)), 0)::bigint AS text_bytes FROM chunks"
         ).fetchone()
-        docs = conn.execute("SELECT count(*)::int AS total_documents FROM documents").fetchone()
+        docs = conn.execute(
+            "SELECT count(*)::int AS total_documents FROM documents WHERE deleted_at IS NULL"
+        ).fetchone()
         return {**row, **docs, "embedding_dimension": _VECTOR_DIM}

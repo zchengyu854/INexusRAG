@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import threading
@@ -65,6 +66,7 @@ from src.storage.database import (
     delete_document as delete_document_record,
     entity_edges,
     entity_evidence_chunks,
+    find_document_by_hash,
     get_chunks as get_database_chunks,
     get_document,
     get_entity,
@@ -74,6 +76,7 @@ from src.storage.database import (
     list_documents as list_database_documents,
     list_conversations,
     replace_chunks,
+    restore_document,
     search_entities_by_text,
     stats as database_stats,
     update_document,
@@ -223,30 +226,67 @@ def _build_graph_job(doc_id: str) -> None:
 
 @router.post("/upload", response_model=dict)
 async def upload(file: UploadFile = File(...)):
+    """上传并登记文档；按内容哈希幂等——同一份资料不会入第二遍。
+
+    改前每上传一次都新建一个 doc_id + 一个新磁盘文件，且 filename 无唯一约束：
+    重传同一份文件会得到两篇同名文档，检索结果里同一篇资料出现两遍。
+    """
     filename = Path(file.filename or "").name
     ext = _file_ext(filename)
     if not filename or not _valid_types(ext):
         raise HTTPException(400, "不支持的文件类型，支持 PDF / MD / TXT")
 
-    doc_id = f"{datetime.now().isoformat(timespec='seconds')}_{uuid.uuid4().hex[:8]}"
-    destination = _UPLOAD_DIR / f"{doc_id}_{filename}"
     content = await file.read(_MAX_UPLOAD_BYTES + 1)
     if len(content) > _MAX_UPLOAD_BYTES:
         raise HTTPException(413, "文件不能超过 50 MB")
-    destination.write_bytes(content)
+
+    digest = hashlib.sha256(content).hexdigest()
+    existing = find_document_by_hash(digest)
+    if existing is not None and existing.get("deleted_at") is None:
+        # 同一内容已入库：幂等返回既有文档，不写新文件、不重复烧 embedding
+        return {
+            "id": existing["id"],
+            "filename": existing["filename"],
+            "status": existing["status"],
+            "duplicate": True,
+        }
+
+    # 内容寻址命名：同内容天然落在同一路径，不会重复占盘
+    destination = _UPLOAD_DIR / f"{digest[:12]}_{filename}"
+    if not destination.exists():
+        destination.write_bytes(content)
+
+    if existing is not None:
+        # 命中软删除过的同一内容 → 重传即恢复，复用原文档行
+        restore_document(existing["id"], str(destination))
+        return {
+            "id": existing["id"],
+            "filename": existing["filename"],
+            "status": "indexing",
+            "duplicate": False,
+            "restored": True,
+        }
+
+    doc_id = f"{datetime.now().isoformat(timespec='seconds')}_{uuid.uuid4().hex[:8]}"
     try:
-        create_document(doc_id, filename, str(destination))
+        create_document(doc_id, filename, str(destination), digest)
     except Exception:
         destination.unlink(missing_ok=True)
         raise
-    return {"id": doc_id, "filename": filename, "status": "indexing"}
+    return {"id": doc_id, "filename": filename, "status": "indexing", "duplicate": False}
 
 
 @router.post("/ingest/{doc_id}", response_model=DocInfo)
-async def trigger_ingest(doc_id: str, background_tasks: BackgroundTasks):
+async def trigger_ingest(doc_id: str, background_tasks: BackgroundTasks, force: bool = False):
     doc = get_document(doc_id)
     if not doc:
         raise HTTPException(404, "文档不存在")
+    if doc.get("deleted_at") is not None:
+        raise HTTPException(409, "文档已删除，请重新上传以恢复")
+    # 幂等：已入库的文档不重复切分与嵌入（前端是「上传后必调 ingest」的串联流程，
+    # 去重上传返回既有文档时会走到这里）。需要强制重建时显式传 force=true。
+    if not force and doc["status"] == "ready" and doc["chunks"] > 0:
+        return _doc_info(doc)
     update_document(doc_id, status="indexing", error=None)
     background_tasks.add_task(_ingest_document, doc_id)
     return _doc_info(get_document(doc_id))
@@ -656,14 +696,16 @@ async def query_stream(request: QueryRequest):
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str):
+    """软删除：标记 deleted_at 并立即回收检索索引，保留磁盘原文以便重传即恢复。
+
+    磁盘文件不在这里删——物理清理交给 scripts/purge_documents.py，
+    这样「删错了」只需要重新上传同一份文件就能恢复。
+    """
     doc = get_document(doc_id)
     if not doc:
         raise HTTPException(404, "文档不存在")
-    source_path = Path(doc["source_path"])
     delete_document_record(doc_id)
-    if source_path.exists():
-        source_path.unlink()
-    return {"ok": True}
+    return {"ok": True, "soft_deleted": True}
 
 
 @router.get("/documents/{doc_id}/file")

@@ -18,6 +18,7 @@ export function DocumentsPage() {
   const [uploading, setUploading] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   const loadDocs = useCallback(async () => {
@@ -54,10 +55,21 @@ export function DocumentsPage() {
     if (list.length === 0) return
     setUploading(true)
     setError(null)
+    setNotice(null)
+    const skipped: string[] = []
     try {
       for (const file of list) {
         const created = await uploadFile(file)
+        // 后端按内容哈希去重：同一份资料已入库时直接返回既有文档，
+        // 此时不能再调 ingest（否则白跑一次切分与嵌入）
+        if (created.duplicate && created.status === "ready") {
+          skipped.push(created.filename)
+          continue
+        }
         await ingestDocument(created.id)
+      }
+      if (skipped.length > 0) {
+        setNotice(`以下文件内容与库中已有文档相同，已跳过重复入库：${skipped.join("、")}`)
       }
       await loadDocs()
     } catch (caught) {
@@ -133,6 +145,12 @@ export function DocumentsPage() {
           </div>
           {toolbar}
         </div>
+
+        {notice ? (
+          <p className="mb-3 rounded-md border border-border bg-muted/60 px-2.5 py-1.5 text-body text-muted-foreground">
+            {notice}
+          </p>
+        ) : null}
 
         {error ? (
           <p className="mb-3 flex items-center gap-1.5 rounded-md border border-destructive/30 px-2.5 py-1.5 text-body text-destructive">
