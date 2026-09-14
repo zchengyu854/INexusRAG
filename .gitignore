@@ -71,3 +71,5 @@ docs/resume-guide.md
 # Policy: only code is published — all documents stay local
 docs/
 *.md
+# ...except the root README, which fronts the repo (anchored to root only)
+!/README.md
