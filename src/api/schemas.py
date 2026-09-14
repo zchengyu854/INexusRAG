@@ -274,6 +274,12 @@ class HealthLLM(BaseModel):
     source: str  # database | env | none
     name: str | None = None
     model: str | None = None
+    # 运行时真实可用性：None = 尚未验证（进程刚起或还没调用过），False = 最近一次调用失败
+    ok: bool | None = None
+    reason: str | None = None
+    hint: str | None = None
+    status_code: int | None = None
+    checked_at: str | None = None
 
 
 class HealthEmbedding(BaseModel):

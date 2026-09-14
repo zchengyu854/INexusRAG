@@ -100,16 +100,26 @@ class LLMClient:
         return self._client
 
     def _create_with_retry(self, **kwargs: Any) -> Any:
-        """带瞬时错误重试的 chat.completions.create：指数退避，最多 max_retries 次重试。"""
+        """带瞬时错误重试的 chat.completions.create：指数退避，最多 max_retries 次重试。
+
+        同时把每次调用的最终结果写进运行时状态（src.llm.status），供 /health 反映
+        LLM 的真实可用性——否则 provider 被拒时界面仍显示「后端正常」。
+        """
+        from src.llm.status import record_failure, record_success
+
         attempts = self.max_retries + 1
         for attempt in range(attempts):
             try:
-                return self._get_client().chat.completions.create(**kwargs)
+                response = self._get_client().chat.completions.create(**kwargs)
             except Exception as exc:
                 if attempt >= attempts - 1 or not _is_transient(exc):
+                    record_failure(exc, self.model)
                     raise
                 delay = self.retry_base_delay * (2**attempt)
                 time.sleep(delay)
+            else:
+                record_success(self.model)
+                return response
 
     def _build_messages(
         self,

@@ -115,6 +115,8 @@ export function SettingsPage() {
       setMessage({ ok: false, text: caught instanceof Error ? caught.message : "测试失败" })
     } finally {
       setBusyId(null)
+      // 测试会写入运行时的 LLM 可用性，重取健康状态让右侧「系统信息」立刻反映结果
+      void load()
     }
   }
 
@@ -345,7 +347,26 @@ export function SettingsPage() {
                 {health?.llm.source === "database" ? "数据库" : health?.llm.source === "env" ? "环境变量" : "未配置"}
               </KeyValueRow>
               <KeyValueRow label="当前模型">{health?.llm.model ?? "—"}</KeyValueRow>
+              <KeyValueRow label="可用性">
+                {!health?.llm.configured
+                  ? "未配置"
+                  : health.llm.ok === true
+                    ? "已验证可用"
+                    : health.llm.ok === false
+                      ? "不可用"
+                      : "未验证"}
+              </KeyValueRow>
             </div>
+            {health?.llm.ok === false ? (
+              <p className="mt-1.5 rounded-md bg-destructive/12 px-2 py-1.5 text-meta leading-snug text-destructive">
+                {health.llm.reason}
+                {health.llm.hint ? <><br />建议：{health.llm.hint}</> : null}
+              </p>
+            ) : health?.llm.ok === null ? (
+              <p className="mt-1.5 text-meta leading-snug text-muted-foreground">
+                本次启动后还没有成功调用过模型；点上方 provider 的「测试」即可验证。
+              </p>
+            ) : null}
           </PanelSection>
 
           <PanelSection label="Embedding">

@@ -208,7 +208,18 @@ export interface HealthStatus {
   status: "ok" | "degraded"
   version: string
   database: { ok: boolean; latency_ms?: number | null; error?: string | null }
-  llm: { configured: boolean; source: "database" | "env" | "none"; name?: string | null; model?: string | null }
+  llm: {
+    configured: boolean
+    source: "database" | "env" | "none"
+    name?: string | null
+    model?: string | null
+    /** 运行时真实可用性：null = 尚未验证（进程刚起或还没调用过） */
+    ok?: boolean | null
+    reason?: string | null
+    hint?: string | null
+    status_code?: number | null
+    checked_at?: string | null
+  }
   embedding: { provider: string; model: string; dimension: number }
   documents: number
   chunks: number

@@ -889,8 +889,20 @@ def health():
     )
     embedding = HealthEmbedding(provider=provider, model=model, dimension=embedding_dimension())
 
+    # LLM 的真实可用性：只报「配没配 key」会误导——provider 被 403/402 拒绝时界面上
+    # 依旧是一盏绿灯。这里带上最近一次真实调用的结果（未调用过则为 None=未验证）。
+    from src.llm.status import snapshot as llm_status_snapshot
+
+    llm_runtime = llm_status_snapshot()
+    llm.ok = llm_runtime["ok"]
+    llm.reason = llm_runtime["reason"]
+    llm.hint = llm_runtime["hint"]
+    llm.status_code = llm_runtime["status_code"]
+    llm.checked_at = llm_runtime["checked_at"]
+
+    degraded = (not database.ok) or (llm.configured and llm.ok is False)
     return HealthStatusResponse(
-        status="ok" if database.ok else "degraded",
+        status="degraded" if degraded else "ok",
         version="0.1.0",
         database=database,
         llm=llm,
