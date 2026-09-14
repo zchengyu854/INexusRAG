@@ -103,7 +103,14 @@ export function SettingsPage() {
     setMessage(null)
     try {
       const result = await testProvider(provider.id)
-      setMessage({ ok: result.ok, text: `${provider.name}：${result.detail}` })
+      const lines = [`${provider.name}：${result.detail}`]
+      // 失败时把「该改什么」和「实际打到了哪个端点」都摊开：
+      // 只显示一句原始报错，用户无从判断是密钥、余额还是端点的问题
+      if (result.hint) lines.push(`建议：${result.hint}`)
+      if (result.provider) {
+        lines.push(`端点：${result.provider.base_url}　模型：${result.provider.model}　密钥：${result.provider.key}`)
+      }
+      setMessage({ ok: result.ok, text: lines.join("\n") })
     } catch (caught) {
       setMessage({ ok: false, text: caught instanceof Error ? caught.message : "测试失败" })
     } finally {
@@ -156,7 +163,7 @@ export function SettingsPage() {
         {message ? (
           <p
             className={cn(
-              "mb-3 rounded-md px-2.5 py-1.5 text-body",
+              "mb-3 whitespace-pre-line rounded-md px-2.5 py-1.5 text-body",
               message.ok ? "bg-success/12 text-success" : "bg-destructive/12 text-destructive"
             )}
           >

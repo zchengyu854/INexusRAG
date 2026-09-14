@@ -610,10 +610,16 @@ def _run_query(
     except Exception as exc:
         # 检索已经拿到结果，不应因为 LLM 不可用（key 失效/限流/超时）把整轮问答打成 500：
         # 降级为提示文案 + 保留命中来源，用户仍能看到检索到了什么。
-        generation_error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        # 文案里给出归类后的原因与建议，而不是甩一句原始英文报错。
+        from src.llm.errors import explain_llm_error
+
+        explained = explain_llm_error(exc)
+        generation_error = f"{explained['type']}: {explained['raw']}"
         answer = (
             "检索已完成，但生成回答时调用大模型失败，下面仅列出命中的原文片段。\n\n"
-            f"错误：{generation_error}"
+            f"原因：{explained['reason']}\n\n"
+            f"建议：{explained['hint']}\n\n"
+            f"技术细节：{generation_error}"
         )
         _emit("token", {"text": answer})
     t_generated = time.perf_counter()
@@ -789,23 +795,50 @@ def activate_llm_provider(provider_id: str):
 
 @router.post("/llm/providers/{provider_id}/test")
 def test_llm_provider(provider_id: str):
-    """用该 provider 的配置发起一次最小补全，验证 key/base_url 可用。"""
+    """用该 provider 的配置发起一次最小补全，验证 key/base_url 可用。
+
+    失败时返回归类后的原因与建议，并附上「实际用的是哪个端点/模型/密钥指纹」——
+    否则用户只看到一句原始英文报错，无从判断该改什么。
+    """
+    from src.llm.errors import describe_key, explain_llm_error
+
     row = get_llm_provider_row(provider_id)
     if row is None:
         raise HTTPException(404, "LLM provider 不存在")
+    target = {
+        "name": row["name"],
+        "base_url": row["base_url"],
+        "model": row["model"],
+        "key": describe_key(row["api_key"]),
+    }
     client = LLMClient(
         api_key=row["api_key"],
         base_url=row["base_url"],
         model=row["model"],
         timeout=float(row["timeout"]),
     )
+    if not client.enabled:
+        return {"ok": False, "detail": "未设置 API Key", "hint": "在下方表单填入该 provider 的密钥",
+                "provider": target}
+    started = time.perf_counter()
     try:
-        if not client.enabled:
-            return {"ok": False, "detail": "未设置 API Key"}
         client.generate("Reply with a single word: ok", sources=[])
-        return {"ok": True, "detail": "连接成功"}
     except Exception as exc:
-        return {"ok": False, "detail": str(exc)}
+        explained = explain_llm_error(exc)
+        return {
+            "ok": False,
+            "detail": explained["reason"],
+            "hint": explained["hint"],
+            "status": explained["status"],
+            "error_type": explained["type"],
+            "raw": explained["raw"],
+            "provider": target,
+        }
+    return {
+        "ok": True,
+        "detail": f"连接成功（{round((time.perf_counter() - started) * 1000)} ms）",
+        "provider": target,
+    }
 
 
 # ---- 健康检查：让前端顶部状态条能反映真实可用性，而不是只 ping 到进程 ----

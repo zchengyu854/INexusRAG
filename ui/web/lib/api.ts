@@ -588,7 +588,18 @@ export async function activateProvider(id: string): Promise<void> {
   if (!res.ok) throw new Error("Activate provider failed")
 }
 
-export async function testProvider(id: string): Promise<{ ok: boolean; detail: string }> {
+export async function testProvider(id: string): Promise<{
+  ok: boolean
+  detail: string
+  /** 失败时的可行动建议 */
+  hint?: string
+  status?: number | null
+  error_type?: string
+  /** provider 原始错误文本，便于排查 */
+  raw?: string
+  /** 实际使用的端点/模型/密钥指纹 */
+  provider?: { name: string; base_url: string; model: string; key: string }
+}> {
   const res = await fetch(`${API_BASE}/llm/providers/${encodeURIComponent(id)}/test`, { method: "POST" })
   if (!res.ok) throw new Error("Test provider failed")
   return res.json()
