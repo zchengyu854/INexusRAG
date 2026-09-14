@@ -7,17 +7,85 @@ from src.retrieval import (
     _extract_article_terms,
     _relevance_filter,
     build_routing_summary,
+    expand_terms,
     extract_terms,
     multi_query_search,
     plan_question,
     rewrite_query,
     rrf_merge,
+    search_terms,
+    synonym_group,
     two_stage_search,
 )
 
 
 def row(cid, score=0.9):
     return {"chunk_id": cid, "score": score}
+
+
+class SynonymTests(unittest.TestCase):
+    """同义词映射：让「插图」能匹配到写「图片」的切片，且不至于把过滤条件放宽成 OR。"""
+
+    def test_known_word_returns_its_group(self):
+        self.assertIn("图片", synonym_group("插图"))
+        self.assertIn("插图", synonym_group("图片"))
+        self.assertIn("illustration", synonym_group("插图"))
+
+    def test_unknown_word_is_its_own_group(self):
+        self.assertEqual(synonym_group("民法典"), ("民法典",))
+
+    def test_expand_terms_adds_variants_without_duplicates(self):
+        out = expand_terms(["插图", "第4页"])
+        self.assertIn("图片", out)
+        self.assertIn("第4页", out)
+        self.assertEqual(len(out), len(set(out)))
+
+    def test_search_terms_expands_question_keywords(self):
+        self.assertIn("图片", search_terms("第4页的插图是什么？"))
+
+    def test_filter_accepts_synonym_variant(self):
+        """关键行为：问「插图」而切片写「图片」，应算命中而不是被滤掉。"""
+        results = [
+            {"chunk_id": "hit", "text": "第4页（图片）：卡通机器人图标", "vector_score": 0.4},
+            {"chunk_id": "miss", "text": "第4页的正文段落", "vector_score": 0.4},
+        ]
+        out = _relevance_filter(results, "第4页的插图是什么？")
+        self.assertEqual([r["chunk_id"] for r in out], ["hit"])
+
+    def test_filter_still_requires_every_group(self):
+        """同义词只在组内放宽，组间仍是 AND——少一个概念的切片不能混进来。
+
+        注意这里不能用「第4页的插图是什么」：jieba 会把「第4页」切成 第/4/页，
+        三者都被停用词与单字规则过滤掉，整句只剩「插图」一个概念，验证不了组间 AND。
+        """
+        results = [
+            {"chunk_id": "only_synonym", "text": "这里有一张图片", "vector_score": 0.4},
+        ]
+        self.assertEqual(_relevance_filter(results, "RAG 论文的插图是什么"), [])
+
+    def test_filter_keeps_chunk_matching_all_groups(self):
+        results = [
+            {"chunk_id": "both", "text": "RAG 论文第4页的图片：卡通机器人图标", "vector_score": 0.4},
+            {"chunk_id": "partial", "text": "RAG 论文的正文段落", "vector_score": 0.4},
+        ]
+        out = _relevance_filter(results, "RAG 论文的插图是什么")
+        self.assertEqual([r["chunk_id"] for r in out], ["both"])
+
+    def test_keyword_channel_receives_expanded_terms(self):
+        """扩召回必须落到关键词通道上，否则同义词只是空转。"""
+        captured: dict = {}
+
+        def fake_tss(vector, top_k, terms, filters=None, use_routing=True, stats=None):
+            captured["terms"] = terms
+            return [row("a")]
+
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
+             patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
+             patch("src.retrieval.keyword_chunks", return_value=[]), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            multi_query_search("第4页的插图是什么？", top_k=2)
+        self.assertIn("图片", captured["terms"])
 
 
 class _FakePlanLLM:

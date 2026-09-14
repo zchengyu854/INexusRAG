@@ -21,25 +21,80 @@ _CJK = re.compile(r"[\u4e00-\u9fff]+\Z")
 # 句尾疑问/修辞后缀：jieba 会把 "条是什么" 切成 ["条是", "什么"]， both 过滤后仍漏 "条是"；
 # 预处理直接抹掉这类后缀及其后的标点，减少对关键词通道的污染。
 _QUESTION_SUFFIXES = re.compile(r"(?:是什么|是多少|有哪些|是什么东西|怎么样|行吗|对吗|吗|呢|吧|啊|么)[^A-Za-z0-9\u4e00-\u9fff]*$")
+# 页码引用（如「第4页」「第 12 页」「第四页」）：jieba 会把它切碎，需整段抽出当关键词
+_PAGE_REF = re.compile(r"第\s*[0-9一二三四五六七八九十百千]+\s*页")
 
 
 def extract_terms(question: str, max_terms: int = 12) -> list[str]:
-    """从问题中提取关键词：jieba 分词 + 数字/字母串，去掉停用词、单字和句尾疑问后缀。"""
+    """从问题中提取关键词：结构化引用（页码/法条）+ jieba 分词，去掉停用词、单字与疑问后缀。
+
+    结构化引用要先抽：jieba 会把「第4页」切成 第/4/页、「第二百三十条」切成 二百三十/条，
+    切碎后要么被单字规则滤掉、要么丢掉「第…条/页」这个决定性的边界信息。这类 token
+    在语料里是强信号（只有少数切片含「第4页」），直接按正则整段取出才能命中。
+    """
     cleaned = _QUESTION_SUFFIXES.sub("", question)
     terms: list[str] = []
     seen: set[str] = set()
+
+    def _add(token: str) -> bool:
+        if token and token not in seen:
+            seen.add(token)
+            terms.append(token)
+        return len(terms) >= max_terms
+
+    for match in _PAGE_REF.finditer(cleaned):
+        if _add(re.sub(r"\s+", "", match.group(0))):
+            return terms
+
     for token in jieba.lcut(cleaned):
         token = token.strip()
         if len(token) < 2 or token in _JUNK:
             continue
         if not (_ASCII.search(token) or _CJK.match(token)):
             continue
-        if token not in seen:
-            seen.add(token)
-            terms.append(token)
-            if len(terms) >= max_terms:
-                break
+        if _add(token):
+            break
     return terms
+
+
+# 同义词组：组内任一词命中即视为该概念命中。
+# 典型场景：问「第4页的插图是什么」而切片里写的是「（图片）」，只按字面匹配永远召回不到。
+# 关键词通道与相关性过滤共用这张表——只扩召回不过滤，扩出来的候选仍会被过滤掉。
+_SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("插图", "图片", "配图", "图注", "图示", "figure", "figures", "illustration", "illustrations"),
+    ("条文", "法条", "条款"),
+    ("作者", "著者", "撰稿人"),
+    ("摘要", "概述", "梗概"),
+    ("数据集", "语料", "语料库"),
+    ("参考文献", "引用文献", "参考书目"),
+    ("模型", "大模型"),
+)
+
+_SYNONYM_LOOKUP: dict[str, tuple[str, ...]] = {}
+for _group in _SYNONYM_GROUPS:
+    for _word in _group:
+        _SYNONYM_LOOKUP.setdefault(_word.lower(), _group)
+del _group, _word
+
+
+def synonym_group(term: str) -> tuple[str, ...]:
+    """返回该词所属的同义词组；无同义词时返回只含自身的单元素组。"""
+    return _SYNONYM_LOOKUP.get(term.lower(), (term,))
+
+
+def expand_terms(terms: list[str]) -> list[str]:
+    """把关键词展开出同义词（去重保序），供关键词通道使用。"""
+    expanded: list[str] = []
+    for term in terms:
+        for variant in synonym_group(term):
+            if variant not in expanded:
+                expanded.append(variant)
+    return expanded
+
+
+def search_terms(question: str) -> list[str]:
+    """检索用关键词：分词后再展开同义词。multi_query_search 与 agent 工具共用。"""
+    return expand_terms(extract_terms(question))
 
 
 def rrf_merge(channels: list[list[dict]], top_k: int, k: int = 60) -> list[dict]:
@@ -96,17 +151,32 @@ def _extract_article_terms(question: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def inject_article_channel(question: str, merged: list[dict], top_k: int) -> list[dict]:
-    """法条编号精确通道：把"第二百三十条"这类精确法条切片补进候选集。
+def _extract_page_terms(question: str) -> list[str]:
+    """从问题中提取页码引用（如「第4页」「第 12 页」）。"""
+    cleaned = _QUESTION_SUFFIXES.sub("", question)
+    return [re.sub(r"\s+", "", match.group(0)) for match in _PAGE_REF.finditer(cleaned)]
 
-    让相关性过滤能优先返回真法条，避免被向量通道排在前面的"第二百三十七条 /
-    第一千二百三十条"等同数字串挤掉。仅当问题含法条编号时生效，不影响普通查询。
+
+def _extract_ref_terms(question: str) -> list[str]:
+    """结构化引用：法条编号 + 页码。
+
+    两者共性极强——在语料里都近乎「命中即唯一」（实测「第4页」只命中 1 块切片），
+    所以给它们单独一档，避免被普通语义词的高频匹配淹没。
+    """
+    return list(dict.fromkeys(_extract_article_terms(question) + _extract_page_terms(question)))
+
+
+def inject_ref_channel(question: str, merged: list[dict], top_k: int) -> list[dict]:
+    """结构化引用精确通道：把「第二百三十条」「第4页」这类唯一命中的切片补进候选集。
+
+    让相关性过滤能优先返回它，避免被向量通道/高频语义词排在前面的同数字串
+    （如「第一千二百三十条」）或其它页的图片块挤掉。仅当问题含此类引用时生效。
     multi_query_search 与 agent 的 search_knowledge 工具共用，保证两条范式行为一致。
     """
-    article_terms = _extract_article_terms(question)
-    if not article_terms:
+    ref_terms = _extract_ref_terms(question)
+    if not ref_terms:
         return merged
-    injected = keyword_chunks(article_terms, limit=max(top_k * 5, 25))
+    injected = keyword_chunks(ref_terms, limit=max(top_k * 5, 25))
     if injected:
         seen_ids = {r["chunk_id"] for r in merged}
         for r in injected:
@@ -146,10 +216,14 @@ def _relevance_filter(results: list[dict], question: str) -> list[dict]:
     """相关性过滤：分三档精确匹配，最后才退回向量分阈值。
 
     匹配优先级（命中即返回该档）：
-      1) 实体词 + 完整法条编号 全部命中（最精确）；
-      2) 仅完整法条编号命中（容忍切片未出现知识库名/实体词，如切片只写 '第二百三十条'）；
+      1) 实体词 + 结构化引用（法条编号/页码）全部命中（最精确）；
+      2) 仅结构化引用命中（法条编号与页码在语料里近乎唯一命中，如「第4页」只对应 1 块）；
       3) 仅实体词命中（容忍法条编号写法差异，如 '第二百三十条' vs '第230条'）；
       — 以上皆无全命中时，看向量余弦最高分：≥ 阈值则保留，否则清空（防止 LLM 基于噪声幻觉）。
+
+    匹配以「同义词组」为单位：组间 AND、组内 OR。这样问「插图」而切片写「图片」也能算命中，
+    否则同义词扩召回出来的候选紧接着又会被这里滤掉。无同义词的词自成单元素组，
+    与改动前的全词 AND 语义完全一致。
 
     典型场景：
     - 问"民点发的230条"，知识库没有"民点"，向量靠"230"捞出体育赔率等噪声 → 清空。
@@ -161,19 +235,27 @@ def _relevance_filter(results: list[dict], question: str) -> list[dict]:
     if not results:
         return results
     terms = [t for t in extract_terms(question) if not _PURE_NUMBER.match(t)]
-    articles = _extract_article_terms(question)
-    if not terms and not articles:
+    refs = _extract_ref_terms(question)
+    if not terms and not refs:
         return results
-    exact_terms = terms + articles
-    exact = [row for row in results if all(t in row.get("text", "") for t in exact_terms)]
+    term_groups = [synonym_group(t) for t in terms]
+    ref_groups = [(r,) for r in refs]
+
+    def covers(row: dict, groups: list[tuple[str, ...]]) -> bool:
+        """每个同义词组至少命中一个变体（组内 OR、组间 AND）。"""
+        text = row.get("text", "")
+        return all(any(variant in text for variant in group) for group in groups)
+
+    exact = [row for row in results if covers(row, term_groups + ref_groups)]
     if exact:
         return exact
-    if articles:
-        exact_art = [row for row in results if all(a in row.get("text", "") for a in articles)]
-        if exact_art:
-            return exact_art
-    if terms:
-        exact_loose = [row for row in results if all(t in row.get("text", "") for t in terms)]
+    if ref_groups:
+        # 结构化引用（法条 / 页码）近乎唯一命中，单独成档以免被高频语义词淹没
+        exact_ref = [row for row in results if covers(row, ref_groups)]
+        if exact_ref:
+            return exact_ref
+    if term_groups:
+        exact_loose = [row for row in results if covers(row, term_groups)]
         if exact_loose:
             return exact_loose
     max_vector = max(row.get("vector_score", 0.0) for row in results)
@@ -399,7 +481,7 @@ def multi_query_search(
     def _search(query: str, vector: list[float], terms: list[str] | None = None) -> list[dict]:
         return two_stage_search(
             vector, top_k=top_k,
-            terms=(extract_terms(query) if terms is None and "keywords" in requested else (terms or [])),
+            terms=(search_terms(query) if terms is None and "keywords" in requested else (terms or [])),
             filters=filters, use_routing=use_routing, stats=stats,
         )
 
@@ -436,7 +518,7 @@ def multi_query_search(
 
     merged = rrf_merge(channels, top_k if "rerank" not in requested else top_k * 5)
     if "keywords" in requested:
-        merged = inject_article_channel(question, merged, top_k)
+        merged = inject_ref_channel(question, merged, top_k)
     merged = _relevance_filter(merged, question)
     fused_count = len(merged) if debug else 0
     rerank_used = False

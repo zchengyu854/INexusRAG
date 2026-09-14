@@ -104,9 +104,9 @@ def _tool_search_knowledge(query: str, top_k: int, filters: dict | None) -> list
     from src.ingestion.embedder import get_embedder
     from src.retrieval import (
         _relevance_filter,
-        extract_terms,
-        inject_article_channel,
+        inject_ref_channel,
         rewrite_query,
+        search_terms,
         two_stage_search,
     )
 
@@ -115,11 +115,11 @@ def _tool_search_knowledge(query: str, top_k: int, filters: dict | None) -> list
     rows = two_stage_search(
         vector,
         top_k=top_k,
-        terms=extract_terms(rewritten),
+        terms=search_terms(rewritten),
         filters=filters,
         use_routing=True,
     )
-    rows = inject_article_channel(rewritten, rows, top_k)
+    rows = inject_ref_channel(rewritten, rows, top_k)
     return _relevance_filter(rows, rewritten)
 
 
