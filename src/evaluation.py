@@ -3,6 +3,7 @@
 用法:
   uv run python -m src.evaluation                          # 默认消融矩阵
   uv run python -m src.evaluation --k 5                    # 指定 K
+  uv run python -m src.evaluation --agent                  # 附带 agent 行 + 成本
   uv run python -m src.evaluation add "问题" 'RAG.pdf:0|fastapi_readme.md:3'
   uv run python -m src.evaluation list
   uv run python -m src.evaluation seed-multihop                 # 种多跳评测例（幂等）
@@ -11,7 +12,9 @@ LLM 判官（答案级评估）后置，检索级指标先支撑消融。
 from __future__ import annotations
 
 import argparse
-import json
+import time
+from collections.abc import Callable
+from typing import Any
 
 from src.storage.database import connection
 
@@ -23,6 +26,9 @@ CREATE TABLE IF NOT EXISTS eval_cases (
     reference_answer TEXT
 )
 """
+
+# runner(question, top_k, features) → list[dict] 或 {"results": [...], "cost": {...}}
+AblationRunner = Callable[[str, int, list[str] | None], Any]
 
 
 def ensure_table() -> None:
@@ -67,21 +73,133 @@ def retrieval_metrics(results: list[dict], expected: set[str], k: int) -> dict:
     return {"hit": hit, "mrr": 1.0 / ranks[0] if ranks else 0.0}
 
 
-def run_ablation(configs: list[tuple[str, list[str] | None]], top_k: int = 5) -> list[dict]:
-    """对每个评测例跑一组 features 配置，输出平均指标行。"""
+def _normalize_runner_out(out: Any) -> tuple[list[dict], dict | None]:
+    """兼容 list 结果与 {results, cost} 包装。"""
+    if isinstance(out, dict) and "results" in out:
+        cost = out.get("cost")
+        return list(out["results"] or []), cost if isinstance(cost, dict) else None
+    return list(out or []), None
+
+
+def pipeline_runner(question: str, top_k: int, features: list[str] | None) -> list[dict]:
     from src.retrieval import multi_query_search
 
+    return multi_query_search(question, top_k, features=features)
+
+
+def agent_runner(
+    question: str,
+    top_k: int,
+    features: list[str] | None,
+    *,
+    max_steps: int = 6,
+) -> dict:
+    """Agent 评测 runner：返回 results + cost（步数 / LLM 调用 / 延迟）。"""
+    from src.agent import run_agent
+
+    t0 = time.perf_counter()
+    out = run_agent(question, top_k=top_k, features=features, max_steps=max_steps)
+    latency_ms = round((time.perf_counter() - t0) * 1000, 1)
+    if out is None:
+        return {
+            "results": [],
+            "cost": {
+                "steps": 0,
+                "llm_calls": 0,
+                "latency_ms": latency_ms,
+                "fallback": True,
+            },
+        }
+    trace = out.get("trace") or {}
+    budget = trace.get("budget") or {}
+    return {
+        "results": out.get("results") or [],
+        "cost": {
+            "steps": len(trace.get("steps") or []),
+            "llm_calls": int(budget.get("llm_calls") or 0),
+            "latency_ms": latency_ms,
+            "fallback": False,
+            "termination": trace.get("termination"),
+        },
+    }
+
+
+def run_ablation(
+    configs: list[tuple],
+    top_k: int = 5,
+) -> list[dict]:
+    """对每个评测例跑一组配置，输出平均指标行。
+
+    configs 项为 (label, features) 或 (label, features, runner)。
+    runner 缺省为 multi_query_search；可返回 list 或 {"results", "cost"}。
+    """
     cases = load_cases()
     rows = []
-    for label, features in configs:
+    for item in configs:
+        if len(item) == 2:
+            label, features = item
+            runner: AblationRunner = pipeline_runner
+        else:
+            label, features, runner = item
         hits, mrrs = 0, 0.0
-        for case in cases:
-            m = retrieval_metrics(multi_query_search(case["question"], top_k, features=features), case["expected"], top_k)
+        steps_sum = llm_sum = 0
+        lat_sum = 0.0
+        cost_n = 0
+        n = len(cases) or 1
+        for index, case in enumerate(cases):
+            results, cost = _normalize_runner_out(runner(case["question"], top_k, features))
+            m = retrieval_metrics(results, case["expected"], top_k)
             hits += m["hit"]
             mrrs += m["mrr"]
-        n = len(cases) or 1
-        rows.append({"label": label, "hit@k": round(hits / n, 3), "mrr": round(mrrs / n, 4)})
+            if cost is not None:
+                cost_n += 1
+                steps_sum += int(cost.get("steps") or 0)
+                llm_sum += int(cost.get("llm_calls") or 0)
+                lat_sum += float(cost.get("latency_ms") or 0.0)
+            # 逐 case 进度：避免长消融时以为卡住
+            if cost is not None:
+                print(
+                    f"  [{label}] {index + 1}/{n} hit={int(m['hit'])} steps={cost.get('steps', 0)}",
+                    flush=True,
+                )
+            else:
+                print(f"  [{label}] {index + 1}/{n} hit={int(m['hit'])}", flush=True)
+        row: dict = {
+            "label": label,
+            "hit@k": round(hits / n, 3),
+            "mrr": round(mrrs / n, 4),
+        }
+        if cost_n:
+            row["avg_steps"] = round(steps_sum / cost_n, 2)
+            row["avg_llm_calls"] = round(llm_sum / cost_n, 2)
+            row["avg_latency_ms"] = round(lat_sum / cost_n, 1)
+        rows.append(row)
     return rows
+
+
+def default_eval_configs(*, include_agent: bool = False, agent_steps: int = 6) -> list[tuple]:
+    """默认消融矩阵；include_agent 时追加 agent 行（同口径 Hit@K + 成本）。"""
+    import os as _os
+
+    from src.retrieval import ALL_FEATURES, _DEFAULT_FEATURES
+
+    strategy = _os.getenv("RERANK_STRATEGY", "rrf")
+    configs: list[tuple] = [
+        ("none(纯向量)", []),
+        ("default(含改写)", None),
+        # rewrite 消融对照：默认集只去掉改写，其余不变——差值即改写通道的增益
+        ("default-改写(关)", [f for f in _DEFAULT_FEATURES if f != "rewrite"]),
+        ("+graph", list(_DEFAULT_FEATURES) + ["graph"]),
+        ("+graph+rerank", list(_DEFAULT_FEATURES) + ["graph", "rerank"]),
+        (f"all(+rerank:{strategy})", list(ALL_FEATURES)),
+    ]
+    if include_agent:
+        def _agent(q: str, k: int, f: list[str] | None, steps: int = agent_steps) -> dict:
+            return agent_runner(q, k, f, max_steps=steps)
+
+        configs.append((f"agent(steps={agent_steps})", None, _agent))
+        configs.append((f"agent+graph(steps={agent_steps})", ["graph"], _agent))
+    return configs
 
 
 # 多跳评测例：答案需要拼接同一文档中相距较远的两块内容。
@@ -130,12 +248,12 @@ def seed_multihop_cases() -> int:
 
 
 def main() -> None:
-    from src.retrieval import ALL_FEATURES, _DEFAULT_FEATURES
-
     parser = argparse.ArgumentParser(description="检索消融评测")
     parser.add_argument("cmd", nargs="?", default="run", choices=["run", "add", "list", "seed-multihop"])
     parser.add_argument("extra", nargs="*", default=[])
     parser.add_argument("--k", type=int, default=5)
+    parser.add_argument("--agent", action="store_true", help="追加 agent 消融行并输出成本列")
+    parser.add_argument("--agent-steps", type=int, default=6)
     ns = parser.parse_args()
 
     if ns.cmd == "add":
@@ -150,22 +268,23 @@ def main() -> None:
     if ns.cmd == "seed-multihop":
         print(f"新增 {seed_multihop_cases()} 条多跳评测例（已有则跳过）")
         return
-    import os as _os
-    strategy = _os.getenv("RERANK_STRATEGY", "rrf")
-    configs = [
-        ("none(纯向量)", []),
-        ("default(路由+关键词+规划)", None),
-        ("+graph", list(_DEFAULT_FEATURES) + ["graph"]),
-        ("+graph+rerank", list(_DEFAULT_FEATURES) + ["graph", "rerank"]),
-        (f"all(+rerank:{strategy})", list(ALL_FEATURES)),
-    ]
+
     ensure_table()
     if not load_cases():
         print("eval_cases 为空：先 `python -m src.evaluation add \"问题\" \"doc:idx|doc:idx\"`")
         return
-    print(f"K={ns.k}")
-    for row in run_ablation(configs, top_k=ns.k):
-        print(f"{row['label']:<18} hit@{ns.k}={row['hit@k']:<8} mrr={row['mrr']}")
+    print(f"K={ns.k}" + ("  (+agent)" if ns.agent else ""))
+    for row in run_ablation(
+        default_eval_configs(include_agent=ns.agent, agent_steps=ns.agent_steps),
+        top_k=ns.k,
+    ):
+        line = f"{row['label']:<28} hit@{ns.k}={row['hit@k']:<8} mrr={row['mrr']}"
+        if "avg_steps" in row:
+            line += (
+                f"  steps={row['avg_steps']:<5} llm={row['avg_llm_calls']:<5}"
+                f"  lat_ms={row['avg_latency_ms']}"
+            )
+        print(line)
 
 
 if __name__ == "__main__":
