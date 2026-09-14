@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 # 检索特性开关；None（不传）= 默认全开除 rerank，显式传 = 只开列出的
-FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "rerank", "graph"]
+FeatureName = Literal["routing", "keywords", "decompose", "stepback", "hyde", "rewrite", "rerank", "graph"]
 
 # 重排策略；None（不传）= 用环境变量 RERANK_STRATEGY，默认 rrf
 RerankStrategy = Literal["rrf", "cross", "llm", "colbert"]
@@ -21,7 +21,9 @@ class QueryRequest(BaseModel):
     conversation_id: str | None = Field(None, min_length=1, max_length=100)
     # 元数据过滤（JSONB 包含）：如 {"page": 5}、{"figure": true}；None 表示不过滤
     filters: dict[str, Any] | None = Field(None, max_length=8)
-    features: list[FeatureName] | None = Field(None, max_length=7)
+    # 上限须与 FeatureName 选项数一致（routing/keywords/decompose/stepback/hyde/rewrite/rerank/graph = 8）；
+    # 加入新特性时这里要同步，否则全选会被 422 拒掉
+    features: list[FeatureName] | None = Field(None, max_length=8)
     # 请求级重排策略覆盖；None 时回退环境变量
     rerank_strategy: RerankStrategy | None = None
     # 检索范式；默认 pipeline，行为与接入 Agentic 前完全一致
@@ -78,6 +80,8 @@ class TracePlan(BaseModel):
     step_back: str | None = None
     hyde: str | None = None
     queries: list[str] = Field(default_factory=list)  # 实际参与检索的查询集合
+    # 确定性 query 改写的产物（去后缀/归一法条/拼实体词）；未生效时为 None
+    rewritten: str | None = None
 
 
 class TraceRouting(BaseModel):
@@ -156,7 +160,7 @@ class QueryTrace(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     sources: list[Source] = []
-    figures: list["Figure"] = []  # 命中图片切片时按页提取的嵌入图（base64 data URI）
+    figures: list["Figure"] = []  # 命中图片切片时按页列出的嵌入图（url 按需拉取 PNG）
     latency_ms: float = 0.0
     conversation_id: str | None = None
     trace: "QueryTrace | None" = None  # 仅 debug=true 时返回
@@ -166,7 +170,8 @@ class Figure(BaseModel):
     page: int
     width: int
     height: int
-    data_uri: str
+    url: str
+    data_uri: str | None = None  # 兼容旧客户端；新路径只填 url
 
 
 class DocInfo(BaseModel):

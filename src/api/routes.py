@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import threading
 import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, Response, StreamingResponse
 
 from src.api.schemas import (
     ChunksPreviewResponse,
@@ -46,6 +52,7 @@ from src.api.schemas import (
 from src.config import embedding_dimension
 from src.evaluation import (
     add_case as add_eval_case,
+    default_eval_configs,
     load_cases as load_eval_cases,
     run_ablation,
 )
@@ -181,8 +188,37 @@ def _ingest_document(doc_id: str) -> None:
             config=config.model_dump(),
             error=None,
         )
+        _maybe_build_graph(doc_id)
     except Exception as exc:
         update_document(doc_id, status="failed", error=str(exc))
+
+
+def _auto_build_graph_enabled() -> bool:
+    return os.getenv("AUTO_BUILD_GRAPH", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _maybe_build_graph(doc_id: str) -> None:
+    """入库/重切后可选按文档增量建图（需 AUTO_BUILD_GRAPH=1）；失败不影响文档 ready。"""
+    if not _auto_build_graph_enabled():
+        return
+    try:
+        from src.graph import build_document
+
+        n = build_document(doc_id, resume=True)
+        print(f"[graph] auto-build doc={doc_id} chunks={n}")
+    except Exception as exc:
+        print(f"[graph] auto-build failed doc={doc_id}: {exc}")
+
+
+def _build_graph_job(doc_id: str) -> None:
+    """后台按文档建图（不 wipe 全库）；供 API 显式触发。"""
+    try:
+        from src.graph import build_document
+
+        n = build_document(doc_id, resume=True)
+        print(f"[graph] build doc={doc_id} chunks={n}")
+    except Exception as exc:
+        print(f"[graph] build failed doc={doc_id}: {exc}")
 
 
 @router.post("/upload", response_model=dict)
@@ -295,6 +331,7 @@ def rechunk_document(doc_id: str, request: RechunkRequest):
             config=new_config.model_dump(),
             error=None,
         )
+        _maybe_build_graph(doc_id)
         return RechunkResult(
             doc_id=doc_id,
             filename=doc["filename"],
@@ -318,6 +355,22 @@ def rechunk_document(doc_id: str, request: RechunkRequest):
             success=False,
             error=str(exc),
         )
+
+
+@router.post("/documents/{doc_id}/build-graph", response_model=dict)
+async def build_document_graph(doc_id: str, background_tasks: BackgroundTasks):
+    """按文档增量建图（不 wipe 全库）。入库后也可设 AUTO_BUILD_GRAPH=1 自动触发。"""
+    doc = get_document(doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+    if doc.get("status") != "ready":
+        raise HTTPException(400, "文档未就绪，请先完成入库")
+    background_tasks.add_task(_build_graph_job, doc_id)
+    return {
+        "doc_id": doc_id,
+        "status": "building",
+        "message": "已在后台按文档增量建图（resume，不清空其他文档的图）",
+    }
 
 
 @router.get("/conversations", response_model=list[ConversationSummary])
@@ -355,7 +408,10 @@ async def clear_conversation(conversation_id: str):
     return {"ok": True}
 
 
-def _run_agent_or_none(request: QueryRequest) -> dict | None:
+def _run_agent_or_none(
+    request: QueryRequest,
+    on_step: Callable[[dict], None] | None = None,
+) -> dict | None:
     """Agentic 检索；任何异常都静默返回 None，由调用方退回单轮管线（绝不整体失败）。"""
     try:
         from src.agent import run_agent
@@ -366,13 +422,54 @@ def _run_agent_or_none(request: QueryRequest) -> dict | None:
             filters=request.filters,
             max_steps=request.max_steps,
             features=request.features,
+            rerank_strategy=request.rerank_strategy,
+            on_step=on_step,
         )
     except Exception:  # agentic 只是锦上添花，出错必须能安静退回已验证的单轮管线
         return None
 
 
-@router.post("/query", response_model=QueryResponse)
-def query(request: QueryRequest):
+def _list_figures(results: list[dict]) -> list[dict]:
+    figures: list[dict] = []
+    fig_pages: dict[str, list[int]] = {}
+    for result in results:
+        meta = result.get("metadata") or {}
+        if meta.get("figure") and result.get("document_id") and meta.get("page"):
+            fig_pages.setdefault(result["document_id"], []).append(int(meta["page"]))
+    if not fig_pages:
+        return figures
+    try:
+        from src.ingestion.loaders import list_page_images
+        for doc_id, page_list in fig_pages.items():
+            doc = get_document(doc_id)
+            src = (doc or {}).get("source_path", "")
+            if not src or not Path(src).exists():
+                continue
+            for img in list_page_images(src, page_list):
+                figures.append({
+                    "page": img["page"],
+                    "width": img["width"],
+                    "height": img["height"],
+                    "url": (
+                        f"/api/documents/{doc_id}/pages/{img['page']}"
+                        f"/images/{img['index']}"
+                    ),
+                })
+    except Exception:
+        return figures
+    return figures
+
+
+def _run_query(
+    request: QueryRequest,
+    emit: Callable[[str, dict], None] | None = None,
+) -> QueryResponse:
+    """问答主路径。emit(event, payload) 用于 SSE；缺省时行为与原来的同步 /query 一致。"""
+
+    def _emit(event: str, payload: dict | None = None) -> None:
+        if emit is not None:
+            emit(event, payload or {})
+
     t0 = time.perf_counter()
     conversation_id = request.conversation_id or str(uuid.uuid4())
     history = get_messages(conversation_id, limit=10)
@@ -381,23 +478,27 @@ def query(request: QueryRequest):
     if database_stats()["total_chunks"] == 0:
         answer = "未检索到相关内容，请先上传并入库文档。"
         save_message(conversation_id, "assistant", answer)
-        return QueryResponse(
+        response = QueryResponse(
             answer=answer,
             sources=[],
             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
             conversation_id=conversation_id,
         )
+        _emit("done", response.model_dump())
+        return response
 
     results: list[dict] = []
     trace_data: dict | None = None
     agent_trace: dict | None = None
 
     if request.mode == "agent":
-        outcome = _run_agent_or_none(request)
+        _emit("stage", {"stage": "agent", "detail": "自主多轮检索"})
+        outcome = _run_agent_or_none(request, on_step=lambda rec: _emit("agent_step", rec))
         if outcome is not None:
             results, agent_trace = outcome["results"], outcome["trace"]
 
     if not results:  # pipeline 模式，或 agent 未产出（静默降级）
+        _emit("stage", {"stage": "retrieve", "detail": "检索知识库"})
         raw = multi_query_search(
             request.question,
             top_k=request.top_k,
@@ -415,12 +516,14 @@ def query(request: QueryRequest):
     if not results:
         answer = "未检索到相关内容，请先上传并入库文档。"
         save_message(conversation_id, "assistant", answer)
-        return QueryResponse(
+        response = QueryResponse(
             answer=answer,
             sources=[],
             latency_ms=round((time.perf_counter() - t0) * 1000, 1),
             conversation_id=conversation_id,
         )
+        _emit("done", response.model_dump())
+        return response
 
     sources = [
         Source(
@@ -432,27 +535,23 @@ def query(request: QueryRequest):
         )
         for result in results
     ]
-    # 命中图片切片时，按 (文档, 页) 提取嵌入图返回（无图/无源文件则空，不报错）
-    figures: list[dict] = []
-    fig_pages: dict[str, list[int]] = {}
-    for result in results:
-        meta = result.get("metadata") or {}
-        if meta.get("figure") and result.get("document_id") and meta.get("page"):
-            fig_pages.setdefault(result["document_id"], []).append(int(meta["page"]))
-    if fig_pages:
-        try:
-            from src.ingestion.loaders import extract_page_images
-            for doc_id, page_list in fig_pages.items():
-                doc = get_document(doc_id)
-                src = (doc or {}).get("source_path", "")
-                if not src or not Path(src).exists():
-                    continue
-                figures.extend(extract_page_images(src, page_list))
-        except Exception:  # 取图失败不影响主回答
-            pass
+    figures = _list_figures(results)
+    _emit("sources", {
+        "sources": [s.model_dump() for s in sources],
+        "figures": figures,
+    })
+    _emit("stage", {"stage": "generate", "detail": "生成回答"})
     generation_error: str | None = None
     try:
-        answer = get_llm().generate(request.question, results, history=history)
+        llm = get_llm()
+        if emit is not None:
+            parts: list[str] = []
+            for token in llm.generate_stream(request.question, results, history=history):
+                parts.append(token)
+                _emit("token", {"text": token})
+            answer = "".join(parts).strip() or "模型没有返回内容。"
+        else:
+            answer = llm.generate(request.question, results, history=history)
     except Exception as exc:
         # 检索已经拿到结果，不应因为 LLM 不可用（key 失效/限流/超时）把整轮问答打成 500：
         # 降级为提示文案 + 保留命中来源，用户仍能看到检索到了什么。
@@ -461,6 +560,7 @@ def query(request: QueryRequest):
             "检索已完成，但生成回答时调用大模型失败，下面仅列出命中的原文片段。\n\n"
             f"错误：{generation_error}"
         )
+        _emit("token", {"text": answer})
     t_generated = time.perf_counter()
     source_data = [source.model_dump() for source in sources]
     save_message(conversation_id, "assistant", answer, source_data)
@@ -477,13 +577,62 @@ def query(request: QueryRequest):
         if agent_trace is not None:
             trace.agent = AgentTrace(**agent_trace)
 
-    return QueryResponse(
+    response = QueryResponse(
         answer=answer,
         sources=sources,
         figures=figures,
         latency_ms=latency_ms,
         conversation_id=conversation_id,
         trace=trace,
+    )
+    _emit("done", response.model_dump())
+    return response
+
+
+@router.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest):
+    # 同步检索/生成可跑几十秒；扔进线程池，避免堵死事件循环。
+    return await run_in_threadpool(_query_sync, request)
+
+
+def _query_sync(request: QueryRequest) -> QueryResponse:
+    return _run_query(request)
+
+
+@router.post("/query/stream")
+async def query_stream(request: QueryRequest):
+    """SSE：stage / agent_step / sources / token / done。前端可 AbortController 取消读取。"""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
+
+    def emit(event: str, payload: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, (event, payload))
+
+    def produce() -> None:
+        try:
+            _run_query(request, emit=emit)
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                ("error", {"message": f"{type(exc).__name__}: {exc}"}),
+            )
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    async def events():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            event, payload = item
+            yield f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -509,6 +658,23 @@ def document_file(doc_id: str):
     if not path.exists():
         raise HTTPException(404, "源文件已丢失，请重新上传")
     return FileResponse(path, filename=doc["filename"], content_disposition_type="inline")
+
+
+@router.get("/documents/{doc_id}/pages/{page}/images/{index}")
+def document_page_image(doc_id: str, page: int, index: int):
+    """按页按序号回传嵌入图 PNG，避免把 base64 塞进 /query JSON。"""
+    doc = get_document(doc_id)
+    if not doc:
+        raise HTTPException(404, "文档不存在")
+    path = Path(doc["source_path"])
+    if not path.exists():
+        raise HTTPException(404, "源文件已丢失，请重新上传")
+    from src.ingestion.loaders import extract_page_image_png
+
+    png = extract_page_image_png(path, page, index)
+    if not png:
+        raise HTTPException(404, "该页没有对应图片")
+    return Response(content=png, media_type="image/png")
 
 
 # ---- LLM providers：在 UI 中管理并选择 LLM，active 的 provider 驱动 get_llm() ----
@@ -692,21 +858,6 @@ def graph_subgraph_view(entity_id: str, hops: int = 2, limit: int = 150):
 # ---- 评测：把 evaluation.py 的消融矩阵暴露给界面 ----
 
 
-def _default_eval_configs() -> list[tuple[str, list[str] | None]]:
-    import os as _os
-
-    from src.retrieval import ALL_FEATURES, _DEFAULT_FEATURES
-
-    strategy = _os.getenv("RERANK_STRATEGY", "rrf")
-    return [
-        ("none(纯向量)", []),
-        ("default(路由+关键词+规划)", None),
-        ("+graph", list(_DEFAULT_FEATURES) + ["graph"]),
-        ("+graph+rerank", list(_DEFAULT_FEATURES) + ["graph", "rerank"]),
-        (f"all(+rerank:{strategy})", list(ALL_FEATURES)),
-    ]
-
-
 @router.get("/eval/cases", response_model=list[EvalCase])
 def eval_cases():
     return [
@@ -738,12 +889,12 @@ def eval_run(request: EvalRunRequest):
     if not cases:
         raise HTTPException(400, "评测集为空，请先添加评测例（或调用 seed-multihop 播种）")
     if request.configs:
-        configs: list[tuple[str, list[str] | None]] = [
+        configs: list[tuple] = [
             (item.label, list(item.features) if item.features is not None else None)
             for item in request.configs
         ]
     else:
-        configs = _default_eval_configs()
+        configs = default_eval_configs()
     rows = run_ablation(configs, top_k=request.k)
     return EvalRunResult(
         k=request.k,
