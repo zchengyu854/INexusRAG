@@ -5,13 +5,16 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import router
 from src.api.schemas import HealthResponse
-from src.storage.database import ensure_database
+from src.storage.database import close_pool, ensure_database
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_database()
-    yield
+    try:
+        yield
+    finally:
+        close_pool()
 
 
 app = FastAPI(

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from contextlib import contextmanager
+from queue import Empty, Full, Queue
 from typing import Iterator
 
 import psycopg
@@ -22,16 +24,135 @@ _DB_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 _DB_USER = os.getenv("POSTGRES_USER", "postgres")
 _DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "")
 _VECTOR_DIM = embedding_dimension()
+_POOL_MIN = int(os.getenv("POSTGRES_POOL_MIN", "1"))
+_POOL_MAX = int(os.getenv("POSTGRES_POOL_MAX", "10"))
 
 
 def _dsn(database: str = _DB_NAME) -> str:
     return f"host={_DB_HOST} port={_DB_PORT} dbname={database} user={_DB_USER} password={_DB_PASSWORD}"
 
 
+class _ConnectionPool:
+    """进程内连接池：一次检索会打很多次库，逐次 connect 是并发墙。
+
+    不引入 psycopg_pool 依赖，行为对齐「借出 / 归还 / 上限等待」。
+    """
+
+    def __init__(self, conninfo: str, min_size: int = 1, max_size: int = 10) -> None:
+        self._conninfo = conninfo
+        self._max = max(1, max_size)
+        self._min = max(0, min(min_size, self._max))
+        self._queue: Queue[psycopg.Connection] = Queue(maxsize=self._max)
+        self._created = 0
+        self._lock = threading.Lock()
+        for _ in range(self._min):
+            self._queue.put(self._connect())
+
+    def _connect(self) -> psycopg.Connection:
+        conn = psycopg.connect(self._conninfo, row_factory=dict_row)
+        with self._lock:
+            self._created += 1
+        return conn
+
+    def getconn(self, timeout: float = 30.0) -> psycopg.Connection:
+        try:
+            return self._queue.get_nowait()
+        except Empty:
+            pass
+        with self._lock:
+            if self._created < self._max:
+                return self._connect()
+        return self._queue.get(timeout=timeout)
+
+    def putconn(self, conn: psycopg.Connection | None) -> None:
+        if conn is None:
+            return
+        if conn.closed:
+            with self._lock:
+                self._created = max(0, self._created - 1)
+            return
+        try:
+            # 归还前清掉未提交事务，避免脏连接污染下一个调用方
+            status = getattr(conn.info, "transaction_status", None)
+            if status is not None and int(status) != 0:  # 0 = IDLE
+                conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created = max(0, self._created - 1)
+            return
+        try:
+            self._queue.put_nowait(conn)
+        except Full:
+            conn.close()
+            with self._lock:
+                self._created = max(0, self._created - 1)
+
+    def close(self) -> None:
+        while True:
+            try:
+                conn = self._queue.get_nowait()
+            except Empty:
+                break
+            try:
+                conn.close()
+            except Exception:
+                pass
+        with self._lock:
+            self._created = 0
+
+
+_pool: _ConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> _ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = _ConnectionPool(
+                    _dsn(),
+                    min_size=max(1, _POOL_MIN),
+                    max_size=max(_POOL_MIN, _POOL_MAX),
+                )
+    return _pool
+
+
+def close_pool() -> None:
+    """测试 / 进程退出时关掉池。"""
+    global _pool
+    with _pool_lock:
+        if _pool is not None:
+            _pool.close()
+            _pool = None
+
+
 @contextmanager
 def connection(database: str = _DB_NAME) -> Iterator[psycopg.Connection]:
-    with psycopg.connect(_dsn(database), row_factory=dict_row) as conn:
+    # 建库等 admin 连接不进池；应用库一律走池。
+    if database != _DB_NAME:
+        with psycopg.connect(_dsn(database), row_factory=dict_row) as conn:
+            yield conn
+        return
+    pool = _get_pool()
+    conn = pool.getconn()
+    try:
         yield conn
+        if not conn.closed:
+            conn.commit()
+    except Exception:
+        if not conn.closed:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        raise
+    finally:
+        pool.putconn(conn)
 
 
 def ensure_database() -> None:
@@ -136,6 +257,11 @@ def ensure_database() -> None:
                 PRIMARY KEY (chunk_id, entity_id)
             );
             CREATE INDEX IF NOT EXISTS chunk_entities_entity_idx ON chunk_entities(entity_id);
+            CREATE TABLE IF NOT EXISTS graph_chunk_done (
+                chunk_id UUID PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+                entity_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             """
         )
         vector_type = conn.execute(
@@ -201,6 +327,9 @@ def delete_document(doc_id: str) -> int:
         return result.rowcount
 
 
+_CHUNK_INSERT_BATCH = 500  # 7 参数/行；PG 上限 65535，500 行远低于上限且语句更稳
+
+
 def replace_chunks(
     doc_id: str,
     doc_name: str,
@@ -213,29 +342,34 @@ def replace_chunks(
     if metadata is not None and len(texts) != len(metadata):
         raise ValueError("texts and metadata length mismatch")
     metadata = metadata or [{} for _ in texts]
-    values = []
-    for index, (text, embedding, item_metadata) in enumerate(zip(texts, embeddings, metadata)):
-        values.extend([
-            str(uuid.uuid4()),
-            doc_id,
-            doc_name,
-            index,
-            text,
-            vector_literal(embedding),
-            json.dumps(item_metadata),
-        ])
-    rows = "(" + "),(".join([", ".join(["%s, %s, %s, %s, %s, %s::vector, %s"]) for _ in texts]) + ")"
     with connection() as conn:
         # Transactional replacement: encoding happens before this function.
         conn.execute("DELETE FROM chunks WHERE document_id = %s", (doc_id,))
-        # ponytail: 单条多行 INSERT，参数数 = 7*chunks，超过 PG 65535 参数上限（约 9000 chunk/文档）时改用 COPY
-        conn.execute(
-            f"""
-            INSERT INTO chunks (id, document_id, doc_name, chunk_index, text, embedding, metadata)
-            VALUES {rows}
-            """,
-            values,
-        )
+        for start in range(0, len(texts), _CHUNK_INSERT_BATCH):
+            batch = list(zip(
+                texts[start:start + _CHUNK_INSERT_BATCH],
+                embeddings[start:start + _CHUNK_INSERT_BATCH],
+                metadata[start:start + _CHUNK_INSERT_BATCH],
+            ))
+            values: list[object] = []
+            for offset, (text, embedding, item_metadata) in enumerate(batch):
+                values.extend([
+                    str(uuid.uuid4()),
+                    doc_id,
+                    doc_name,
+                    start + offset,
+                    text,
+                    vector_literal(embedding),
+                    json.dumps(item_metadata),
+                ])
+            rows = "(" + "),(".join([", ".join(["%s, %s, %s, %s, %s, %s::vector, %s"]) for _ in batch]) + ")"
+            conn.execute(
+                f"""
+                INSERT INTO chunks (id, document_id, doc_name, chunk_index, text, embedding, metadata)
+                VALUES {rows}
+                """,
+                values,
+            )
 
 
 def get_chunks(doc_id: str) -> list[dict]:
@@ -273,28 +407,35 @@ def search_chunks(query_embedding: list[float], top_k: int = 5, doc_id: str | No
 
 
 def keyword_chunks(terms: list[str], limit: int = 50, filters: dict | None = None) -> list[dict]:
-    """词汇通道：大小写不敏感子串匹配，由 trigram GIN 索引服务；filters 同 search_chunks。"""
+    """词汇通道：大小写不敏感子串匹配；score = 命中词数，按分数排序。
+
+    ponytail: GIN trigram 只支持单模式/AND，多词 OR 退回 Seq Scan；数据量大时换 tsvector+zhparser。
+    """
     if not terms:
         return []
+
     def _escape(term: str) -> str:
         return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     patterns = [f"%{_escape(t)}%" for t in terms]
-    # ponytail: GIN trigram 只支持单模式/AND，多词 OR 退回 Seq Scan；数据量大时换 tsvector+zhparser 分词列
-    where = ["(" + " OR ".join(["text ILIKE %s"] * len(patterns)) + ")"]
+    # 命中几个词就得几分，让 RRF 之外的并列也能区分「全中」与「沾边一词」
+    hit_score = " + ".join(["(text ILIKE %s)::int"] * len(patterns))
+    where = [f"({hit_score}) > 0"]
     params: list[object] = list(patterns)
     if filters:
         where.append("metadata @> %s::jsonb")
         params.append(json.dumps(filters, ensure_ascii=False))
     sql = f"""
         SELECT id::text AS chunk_id, document_id, doc_name, chunk_index, text, metadata,
-               0::double precision AS score
+               ({hit_score})::double precision AS score
         FROM chunks
         WHERE {' AND '.join(where)}
+        ORDER BY score DESC, chunk_index ASC
         LIMIT %s
     """
+    # WHERE 与 SELECT 各用一套 pattern 绑定
     with connection() as conn:
-        return list(conn.execute(sql, [*params, limit]))
+        return list(conn.execute(sql, [*patterns, *params, limit]))
 
 
 def upsert_doc_index(doc_id: str, doc_name: str, summary: str, embedding: list[float]) -> None:
@@ -418,9 +559,27 @@ def get_chunks_for_graph(doc_id: str) -> list[dict]:
         ))
 
 
-def chunk_has_entities(chunk_id: str) -> bool:
-    """该切片是否已建过图（断点续跑用；抽取无实体的切片会重复处理，属少数）。"""
+def mark_chunk_graph_done(chunk_id: str, entity_count: int = 0) -> None:
+    """标记切片已完成图谱抽取（含 0 实体），resume 时跳过，避免空块反复烧 LLM。"""
     with connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO graph_chunk_done (chunk_id, entity_count)
+            VALUES (%s, %s)
+            ON CONFLICT (chunk_id) DO UPDATE SET entity_count = EXCLUDED.entity_count
+            """,
+            (chunk_id, max(0, int(entity_count))),
+        )
+
+
+def chunk_has_entities(chunk_id: str) -> bool:
+    """该切片是否已完成图谱抽取（含空抽取）。优先看 graph_chunk_done；旧数据回退 chunk_entities。"""
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM graph_chunk_done WHERE chunk_id = %s LIMIT 1", (chunk_id,)
+        ).fetchone()
+        if row is not None:
+            return True
         row = conn.execute(
             "SELECT 1 FROM chunk_entities WHERE chunk_id = %s LIMIT 1", (chunk_id,)
         ).fetchone()
@@ -482,6 +641,7 @@ def reset_graph() -> None:
     with connection() as conn:
         conn.execute("DELETE FROM relations")
         conn.execute("DELETE FROM chunk_entities")
+        conn.execute("DELETE FROM graph_chunk_done")
         conn.execute("DELETE FROM entities")
 
 
