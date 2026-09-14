@@ -58,7 +58,16 @@ export interface Figure {
   page: number
   width: number
   height: number
-  data_uri: string
+  url: string
+  data_uri?: string | null
+}
+
+/** 聊天里展示图片：优先独立 URL，兼容旧的 base64 data URI。 */
+export function figureSrc(figure: Figure): string {
+  if (figure.data_uri) return figure.data_uri
+  if (figure.url.startsWith("http") || figure.url.startsWith("data:")) return figure.url
+  const origin = API_BASE.replace(/\/api\/?$/, "")
+  return `${origin}${figure.url.startsWith("/") ? figure.url : `/${figure.url}`}`
 }
 
 export interface PreviewResult {
@@ -119,6 +128,8 @@ export interface TracePlan {
   step_back: string | null
   hyde: string | null
   queries: string[]
+  /** 确定性 query 改写的产物（去疑问词/归一法条编号）；未生效时为 null。 */
+  rewritten: string | null
 }
 
 export interface TraceRouting {
@@ -148,6 +159,34 @@ export interface TraceTimings {
   generate_ms: number
 }
 
+// ---- 检索范式 ----
+
+/** pipeline = 现有单轮多通道管线；agent = Agentic 自主多轮循环。 */
+export type QueryMode = "pipeline" | "agent"
+
+/** Agentic 循环的单步记录。 */
+export interface AgentStep {
+  step: number
+  thought: string | null
+  tool: string
+  args: Record<string, unknown>
+  observation: string | null
+  new_chunks: number
+  error: string | null
+  latency_ms: number
+}
+
+/** Agentic 循环的过程快照，仅 mode=agent 且未降级时由后端返回。 */
+export interface AgentTrace {
+  steps: AgentStep[]
+  termination: string | null // answered | budget | max_steps | stagnant | error
+  budget: Record<string, unknown>
+  evidence_chunks: number
+  tools: string[]
+  /** features 含 rerank 时对累积证据池做的终排策略；未启用/失败退回时为 null。 */
+  rerank?: string | null
+}
+
 export interface QueryTrace {
   features: string[]   // 请求的特性集
   applied: string[]    // 真正生效的特性集
@@ -158,6 +197,7 @@ export interface QueryTrace {
   channels: TraceChannel[]
   fusion: TraceFusion
   timings: TraceTimings
+  agent?: AgentTrace | null // 仅 mode=agent 且未降级时非空
 }
 
 // ---- 健康状态 ----
@@ -345,12 +385,28 @@ export interface QueryOptions {
   filters?: Record<string, string | number | boolean> | null
   features?: string[] | null
   rerankStrategy?: RerankStrategy | null
+  mode?: QueryMode
+  maxSteps?: number
   debug?: boolean
 }
 
 export async function queryDoc(question: string, options: QueryOptions): Promise<QueryResult> {
-  const { conversationId, topK = 5, filters, features, rerankStrategy, debug = false } = options
+  const {
+    conversationId,
+    topK = 5,
+    filters,
+    features,
+    rerankStrategy,
+    mode = "pipeline",
+    maxSteps = 6,
+    debug = false,
+  } = options
   const hasFilters = filters && Object.keys(filters).length > 0
+  // 仅在 agent 模式下携带 mode / max_steps：pipeline 请求保持与改动前完全一致
+  const agentPart =
+    mode === "agent"
+      ? { mode, max_steps: Math.min(12, Math.max(1, maxSteps)) }
+      : {}
   const res = await fetch(`${API_BASE}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -361,11 +417,115 @@ export async function queryDoc(question: string, options: QueryOptions): Promise
       ...(hasFilters ? { filters } : {}),
       ...(features ? { features } : {}),
       ...(rerankStrategy ? { rerank_strategy: rerankStrategy } : {}),
+      ...agentPart,
       ...(debug ? { debug: true } : {}),
     }),
   })
   if (!res.ok) throw new Error(`问答请求失败（HTTP ${res.status}）`)
   return res.json()
+}
+
+export type QueryStreamHandlers = {
+  onStage?: (stage: string, detail?: string) => void
+  onAgentStep?: (step: AgentStep) => void
+  onSources?: (sources: Source[], figures: Figure[]) => void
+  onToken?: (text: string) => void
+}
+
+function queryBody(question: string, options: QueryOptions): string {
+  const {
+    conversationId,
+    topK = 5,
+    filters,
+    features,
+    rerankStrategy,
+    mode = "pipeline",
+    maxSteps = 6,
+    debug = false,
+  } = options
+  const hasFilters = filters && Object.keys(filters).length > 0
+  const agentPart =
+    mode === "agent"
+      ? { mode, max_steps: Math.min(12, Math.max(1, maxSteps)) }
+      : {}
+  return JSON.stringify({
+    question,
+    conversation_id: conversationId,
+    top_k: topK,
+    ...(hasFilters ? { filters } : {}),
+    ...(features ? { features } : {}),
+    ...(rerankStrategy ? { rerank_strategy: rerankStrategy } : {}),
+    ...agentPart,
+    ...(debug ? { debug: true } : {}),
+  })
+}
+
+/** SSE 问答：token / 阶段 / agent 步骤实时回调；signal 用于取消。 */
+export async function queryDocStream(
+  question: string,
+  options: QueryOptions,
+  handlers: QueryStreamHandlers = {},
+  signal?: AbortSignal
+): Promise<QueryResult> {
+  const res = await fetch(`${API_BASE}/query/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: queryBody(question, options),
+    signal,
+  })
+  if (!res.ok) throw new Error(`问答请求失败（HTTP ${res.status}）`)
+  if (!res.body) throw new Error("浏览器不支持流式读取")
+
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let done: QueryResult | null = null
+  const reader = res.body.getReader()
+
+  const dispatch = (rawEvent: string, rawData: string) => {
+    if (!rawData) return
+    const data = JSON.parse(rawData) as Record<string, unknown>
+    if (rawEvent === "stage") {
+      handlers.onStage?.(String(data.stage ?? ""), typeof data.detail === "string" ? data.detail : undefined)
+      return
+    }
+    if (rawEvent === "agent_step") {
+      handlers.onAgentStep?.(data as unknown as AgentStep)
+      return
+    }
+    if (rawEvent === "sources") {
+      handlers.onSources?.((data.sources as Source[]) ?? [], (data.figures as Figure[]) ?? [])
+      return
+    }
+    if (rawEvent === "token") {
+      handlers.onToken?.(String(data.text ?? ""))
+      return
+    }
+    if (rawEvent === "error") {
+      throw new Error(String(data.message ?? "问答失败"))
+    }
+    if (rawEvent === "done") {
+      done = data as unknown as QueryResult
+    }
+  }
+
+  while (true) {
+    const { value, done: eof } = await reader.read()
+    if (eof) break
+    buffer += decoder.decode(value, { stream: true })
+    const frames = buffer.split("\n\n")
+    buffer = frames.pop() ?? ""
+    for (const frame of frames) {
+      let eventName = "message"
+      const dataLines: string[] = []
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) eventName = line.slice(6).trim()
+        else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim())
+      }
+      dispatch(eventName, dataLines.join("\n"))
+    }
+  }
+  if (!done) throw new Error("流式问答未返回完整结果")
+  return done
 }
 
 export async function getConversationMessages(conversationId: string): Promise<ChatMessage[]> {
@@ -460,6 +620,15 @@ export async function getSubgraph(entityId: string, hops = 2, limit = 150): Prom
   const params = new URLSearchParams({ entity_id: entityId, hops: String(hops), limit: String(limit) })
   const res = await fetch(`${API_BASE}/graph/subgraph?${params.toString()}`)
   if (!res.ok) throw new Error("获取子图失败")
+  return res.json()
+}
+
+export async function buildDocumentGraph(docId: string): Promise<{ doc_id: string; status: string; message: string }> {
+  const res = await fetch(`${API_BASE}/documents/${encodeURIComponent(docId)}/build-graph`, { method: "POST" })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "")
+    throw new Error(detail || `建图失败（HTTP ${res.status}）`)
+  }
   return res.json()
 }
 

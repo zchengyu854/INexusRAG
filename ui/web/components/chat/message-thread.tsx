@@ -5,7 +5,8 @@ import { Bot, Loader2, ScanText } from "lucide-react"
 import { SourceChip, sourceAnchorId } from "@/components/chat/source-chip"
 import { featureLabels } from "@/components/chat/feature-toggle"
 import { Markdown } from "@/components/ui/markdown"
-import type { Figure, QueryTrace, Source } from "@/lib/api"
+import type { Figure, QueryMode, QueryTrace, Source } from "@/lib/api"
+import { figureSrc } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
 export interface ChatMessageView {
@@ -15,15 +16,25 @@ export interface ChatMessageView {
   sources?: Source[]
   figures?: Figure[]
   features?: string[] | null
+  mode?: QueryMode | null
   latency_ms?: number
   trace?: QueryTrace | null
   pending?: boolean
 }
 
 export const STAGES = ["规划检索…", "检索知识库…", "生成回答…"] as const
+export const STAGE_LABELS: Record<string, string> = {
+  retrieve: "检索知识库…",
+  agent: "Agent 检索…",
+  generate: "生成回答…",
+}
 
 function metaLine(message: ChatMessageView): string | null {
   const parts: string[] = []
+  if (message.mode === "agent") {
+    // 同一轮请求了 agent，但有 trace 却没有 agent 轨迹 → 后端已静默降级为管线
+    parts.push(message.trace?.agent ? "Agent" : "Agent→管线")
+  }
   const labels = featureLabels(message.features)
   if (labels) parts.push(labels)
   if (message.latency_ms != null) parts.push(`${(message.latency_ms / 1000).toFixed(1)}s`)
@@ -76,6 +87,15 @@ export function MessageThread({
             </span>
             <div className="min-w-0 flex-1 space-y-2 rounded-lg border border-border bg-card px-3 py-2.5">
               <Markdown content={message.content} onCite={highlightAnchor} />
+              {message.pending && message.content ? (
+                <p className="font-mono text-meta text-muted-foreground">生成中…</p>
+              ) : null}
+              {message.pending && !message.content ? (
+                <div className="flex items-center gap-2 text-body text-muted-foreground">
+                  <Loader2 className="size-3.5 animate-spin" />
+                  {stage}
+                </div>
+              ) : null}
 
               {message.figures && message.figures.length > 0 ? (
                 <div className="flex flex-wrap gap-2">
@@ -83,7 +103,7 @@ export function MessageThread({
                     <figure key={index} className="max-w-[220px] rounded-md border border-border p-1">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
-                        src={figure.data_uri}
+                        src={figureSrc(figure)}
                         alt={`第 ${figure.page} 页的图片`}
                         width={Math.min(figure.width, 220)}
                         height={Math.round((figure.height / Math.max(figure.width, 1)) * Math.min(figure.width, 220))}
@@ -130,7 +150,7 @@ export function MessageThread({
         )
       })}
 
-      {loading ? (
+      {loading && !messages.some((message) => message.pending) ? (
         <div className="flex animate-fade-up items-start gap-2.5">
           <span className="mt-1 flex size-6 shrink-0 items-center justify-center rounded-md bg-primary/12">
             <Bot className="size-3.5 text-primary" />

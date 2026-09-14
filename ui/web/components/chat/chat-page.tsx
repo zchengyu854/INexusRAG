@@ -11,7 +11,7 @@ import {
   initialFeatureState,
   selectedFeatures,
 } from "@/components/chat/feature-toggle"
-import { MessageThread, STAGES, type ChatMessageView } from "@/components/chat/message-thread"
+import { MessageThread, STAGE_LABELS, type ChatMessageView } from "@/components/chat/message-thread"
 import { RetrievalInspector } from "@/components/chat/retrieval-inspector"
 import {
   filtersToRecord,
@@ -24,18 +24,23 @@ import {
   clearConversation,
   getConversationMessages,
   getConversations,
-  queryDoc,
+  queryDocStream,
+  type AgentStep,
   type ConversationSummary,
+  type QueryTrace,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
 const CONVERSATION_KEY = "nexus-rag-conversation-id"
-const SETTINGS_KEY = "nexus-rag-retrieval-settings"
-const STAGE_INTERVAL_MS = 1400
+// v2：新增 rewrite 特性进默认集（基础装置）。旧 v1 存档的 features 数组里没有 rewrite，
+// 直接沿用会让新默认失效，故升键让新默认生效一次。
+const SETTINGS_KEY = "nexus-rag-retrieval-settings-v2"
 const RERANK_CHOICES: RerankChoice[] = ["auto", "rrf", "cross", "llm", "colbert"]
 
 function defaultSettings(): RetrievalConfig {
   return {
+    mode: "pipeline",
+    maxSteps: 6,
     features: initialFeatureState(DEFAULT_FEATURES),
     topK: 5,
     rerankStrategy: "auto",
@@ -50,6 +55,11 @@ function readStoredSettings(): RetrievalConfig {
     if (!raw) return base
     const parsed = JSON.parse(raw) as Record<string, unknown>
     return {
+      mode: parsed.mode === "agent" ? "agent" : "pipeline",
+      maxSteps:
+        typeof parsed.maxSteps === "number" && parsed.maxSteps >= 1 && parsed.maxSteps <= 12
+          ? parsed.maxSteps
+          : base.maxSteps,
       features: Array.isArray(parsed.features)
         ? initialFeatureState(parsed.features as string[])
         : base.features,
@@ -81,7 +91,7 @@ export function ChatPage() {
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [stageIndex, setStageIndex] = useState(0)
+  const [stage, setStage] = useState(STAGE_LABELS.retrieve)
   const [settings, setSettings] = useState<RetrievalConfig>(() => defaultSettings())
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [inspectingId, setInspectingId] = useState<string | null>(null)
@@ -89,6 +99,7 @@ export function ChatPage() {
   // 已从服务端加载过的会话，避免"自己刚发消息"时被回源请求覆盖掉乐观消息
   const loadedRef = useRef<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -138,14 +149,6 @@ export function ChatPage() {
   }, [conversationId])
 
   useEffect(() => {
-    if (!loading) return
-    const timer = window.setInterval(() => {
-      setStageIndex((index) => (index + 1) % STAGES.length)
-    }, STAGE_INTERVAL_MS)
-    return () => window.clearInterval(timer)
-  }, [loading])
-
-  useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: "end" })
   }, [messages, loading])
 
@@ -192,47 +195,129 @@ export function ChatPage() {
     }
 
     const activeFeatures = selectedFeatures(settings.features)
+    const assistantId = `local-assistant-${Date.now()}`
     setMessages((previous) => [
       ...previous,
       { id: `local-user-${Date.now()}`, role: "user", content: question },
+      {
+        id: assistantId,
+        role: "assistant",
+        content: "",
+        pending: true,
+        features: activeFeatures,
+        mode: settings.mode,
+      },
     ])
     setInput("")
     setError(null)
-    setStageIndex(0)
+    setStage(settings.mode === "agent" ? STAGE_LABELS.agent : STAGE_LABELS.retrieve)
     setLoading(true)
+    setInspectingId(assistantId)
+
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    const patchAssistant = (patch: Partial<ChatMessageView>) => {
+      setMessages((previous) =>
+        previous.map((message) => (message.id === assistantId ? { ...message, ...patch } : message))
+      )
+    }
 
     try {
-      const result = await queryDoc(question, {
-        conversationId: cid,
-        topK: settings.topK,
-        filters: filtersToRecord(settings.filters),
-        features: activeFeatures,
-        rerankStrategy: settings.rerankStrategy === "auto" ? null : settings.rerankStrategy,
-        debug: true,
-      })
-      const assistantId = `local-assistant-${Date.now()}`
-      setMessages((previous) => [
-        ...previous,
+      const result = await queryDocStream(
+        question,
         {
-          id: assistantId,
-          role: "assistant",
-          content: result.answer,
-          sources: result.sources,
-          figures: result.figures,
+          conversationId: cid,
+          topK: settings.topK,
+          filters: filtersToRecord(settings.filters),
           features: activeFeatures,
-          latency_ms: result.latency_ms,
-          trace: result.trace ?? null,
+          rerankStrategy: settings.rerankStrategy === "auto" ? null : settings.rerankStrategy,
+          mode: settings.mode,
+          maxSteps: settings.maxSteps,
+          debug: inspectorOpen,
         },
-      ])
-      if (result.trace) {
-        setInspectingId(assistantId)
-      }
+        {
+          onStage: (name, detail) => {
+            setStage(STAGE_LABELS[name] ?? detail ?? STAGE_LABELS.retrieve)
+          },
+          onToken: (text) => {
+            setMessages((previous) =>
+              previous.map((message) =>
+                message.id === assistantId
+                  ? { ...message, content: message.content + text, pending: true }
+                  : message
+              )
+            )
+          },
+          onSources: (sources, figures) => {
+            patchAssistant({ sources, figures })
+          },
+          onAgentStep: (step: AgentStep) => {
+            setMessages((previous) =>
+              previous.map((message) => {
+                if (message.id !== assistantId) return message
+                const prev = message.trace
+                const steps = [...(prev?.agent?.steps ?? []), step]
+                const nextTrace: QueryTrace = {
+                  features: prev?.features ?? [],
+                  applied: prev?.applied ?? [],
+                  skipped: prev?.skipped ?? [],
+                  params: prev?.params ?? { top_k: settings.topK, filters: {}, rerank_strategy: null },
+                  plan: prev?.plan ?? { subs: [], step_back: null, hyde: null, queries: [], rewritten: null },
+                  routing: prev?.routing ?? { routed_docs: 0, top_score: 0, fallback: false, min_score: 0 },
+                  channels: prev?.channels ?? [],
+                  fusion: prev?.fusion ?? { channels: 0, pre_merge: 0, post_merge: 0, rerank: null, final: 0 },
+                  timings: prev?.timings ?? { plan_ms: 0, retrieve_ms: 0, generate_ms: 0 },
+                  agent: {
+                    steps,
+                    termination: prev?.agent?.termination ?? null,
+                    budget: prev?.agent?.budget ?? {},
+                    evidence_chunks: prev?.agent?.evidence_chunks ?? 0,
+                    tools: prev?.agent?.tools ?? [],
+                  },
+                }
+                return { ...message, trace: nextTrace }
+              })
+            )
+          },
+        },
+        controller.signal
+      )
+      patchAssistant({
+        content: result.answer,
+        sources: result.sources,
+        figures: result.figures,
+        latency_ms: result.latency_ms,
+        trace: result.trace ?? null,
+        pending: false,
+      })
+      if (result.trace) setInspectingId(assistantId)
       void refreshConversations()
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "问答失败，请稍后重试")
+      if (caught instanceof DOMException && caught.name === "AbortError") {
+        setMessages((previous) =>
+          previous.map((message) =>
+            message.id === assistantId
+              ? {
+                  ...message,
+                  pending: false,
+                  content: message.content || "已停止生成。",
+                }
+              : message
+          )
+        )
+      } else {
+        setMessages((previous) => previous.filter((message) => message.id !== assistantId))
+        setError(caught instanceof Error ? caught.message : "问答失败，请稍后重试")
+      }
     } finally {
+      abortRef.current = null
       setLoading(false)
     }
+  }
+
+  function handleCancel() {
+    abortRef.current?.abort()
   }
 
   async function handleClear() {
@@ -280,7 +365,7 @@ export function ChatPage() {
               <MessageThread
                 messages={messages}
                 loading={loading}
-                stage={STAGES[stageIndex]}
+                stage={stage}
                 error={error}
                 onInspect={(id) => {
                   setInspectingId(id)
@@ -298,6 +383,7 @@ export function ChatPage() {
           onChange={setInput}
           onSend={handleSend}
           onClear={handleClear}
+          onCancel={handleCancel}
           loading={loading}
           canClear={messages.length > 0}
           settings={settings}
@@ -307,6 +393,7 @@ export function ChatPage() {
 
       {inspectorOpen ? (
         <RetrievalInspector
+          mode={inspectingMessage?.mode ?? null}
           trace={inspectingMessage?.trace ?? null}
           sources={inspectingMessage?.sources ?? []}
           loading={loading}

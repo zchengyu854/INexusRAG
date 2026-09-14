@@ -2,10 +2,11 @@
 
 import { ChevronRight, Loader2 } from "lucide-react"
 
+import { AgentTimeline } from "@/components/chat/agent-timeline"
 import { featureLabel } from "@/components/chat/feature-toggle"
 import { BarRow } from "@/components/ui/metric"
 import { Panel, PanelBody, PanelHeader, PanelSection } from "@/components/ui/panel"
-import type { QueryTrace, Source } from "@/lib/api"
+import type { QueryMode, QueryTrace, Source } from "@/lib/api"
 
 function formatMs(value: number): string {
   return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${Math.round(value)}ms`
@@ -42,16 +43,20 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 
 /** 检索检视面板：把 multi_query_search 的内部过程摊开。默认收起，由问答页控制显隐。 */
 export function RetrievalInspector({
+  mode,
   trace,
   sources,
   loading,
   onClose,
 }: {
+  mode?: QueryMode | null
   trace: QueryTrace | null
   sources: Source[]
   loading: boolean
   onClose: () => void
 }) {
+  const agent = trace?.agent ?? null
+  const degraded = mode === "agent" && agent === null
   const maxHits = trace ? Math.max(...trace.channels.map((channel) => channel.hits), 1) : 1
   const filterEntries = trace ? Object.entries(trace.params.filters ?? {}) : []
 
@@ -85,130 +90,152 @@ export function RetrievalInspector({
           </p>
         ) : null}
 
-        {trace ? (
+        {agent ? (
+          <PanelSection label="Agent 检索轨迹">
+            <AgentTimeline trace={agent} />
+          </PanelSection>
+        ) : (
           <>
-            <PanelSection label="本次参数">
-              <div className="space-y-0.5">
-                <Row label="top_k">{trace.params.top_k}</Row>
-                <Row label="重排策略">{trace.params.rerank_strategy ?? "未启用"}</Row>
-                <Row label="元数据过滤">
-                  {filterEntries.length === 0
-                    ? "无"
-                    : filterEntries.map(([key, value]) => `${key}=${String(value)}`).join(", ")}
-                </Row>
-              </div>
-            </PanelSection>
-
-            <PanelSection label="生效特性">
-              <div className="flex flex-wrap gap-1">
-                {trace.applied.length === 0 ? (
-                  <span className="text-meta text-muted-foreground">无（仅向量通道）</span>
-                ) : (
-                  trace.applied.map((name) => (
-                    <Chip key={name} tone="primary">
-                      {featureLabel(name)}
-                    </Chip>
-                  ))
-                )}
-              </div>
-            </PanelSection>
-
-            {trace.skipped.length > 0 ? (
-              <PanelSection label={`未生效（${trace.skipped.length}）`}>
-                <ul className="space-y-1.5">
-                  {trace.skipped.map((item) => (
-                    <li key={item.name} className="rounded-md bg-muted/50 px-2 py-1.5">
-                      <p className="text-meta font-medium text-warning">{featureLabel(item.name)}</p>
-                      <p className="mt-0.5 text-meta leading-snug text-muted-foreground">{item.reason}</p>
-                    </li>
-                  ))}
-                </ul>
+            {degraded ? (
+              <PanelSection label="模式提示">
+                <p className="rounded-md bg-warning/10 px-2 py-1.5 text-meta leading-snug text-warning">
+                  请求了 Agent，但本轮没有返回 Agent 轨迹，已静默降级为管线模式（回答形态一致）。常见原因：LLM 未配置、Agent 中途报错、或没拿到任何证据。
+                </p>
               </PanelSection>
             ) : null}
 
-            <PanelSection label="规划输出">
-              <div className="flex flex-wrap gap-1">
-                <Chip title={trace.plan.subs.join("\n") || undefined}>子问题 ×{trace.plan.subs.length}</Chip>
-                <Chip>退步 ×{trace.plan.step_back ? 1 : 0}</Chip>
-                <Chip>HyDE ×{trace.plan.hyde ? 1 : 0}</Chip>
-                <Chip>查询 ×{trace.plan.queries.length}</Chip>
-              </div>
-              {trace.plan.subs.length > 0 ? (
-                <ol className="mt-1.5 space-y-1 text-meta leading-snug text-muted-foreground">
-                  {trace.plan.subs.slice(0, 5).map((sub, index) => (
-                    <li key={index} className="line-clamp-2">
-                      {index + 1}. {sub}
-                    </li>
-                  ))}
-                </ol>
-              ) : null}
-              {trace.plan.step_back ? (
-                <p className="mt-1 line-clamp-2 text-meta leading-snug text-muted-foreground">
-                  退步：{trace.plan.step_back}
-                </p>
-              ) : null}
-              {trace.plan.hyde ? (
-                <details className="mt-1">
-                  <summary className="cursor-pointer text-meta text-muted-foreground">假想文档</summary>
-                  <p className="mt-1 line-clamp-6 text-meta leading-snug text-muted-foreground">{trace.plan.hyde}</p>
-                </details>
-              ) : null}
-            </PanelSection>
+            {trace ? (
+              <>
+                <PanelSection label="本次参数">
+                  <div className="space-y-0.5">
+                    <Row label="top_k">{trace.params.top_k}</Row>
+                    <Row label="重排策略">{trace.params.rerank_strategy ?? "未启用"}</Row>
+                    <Row label="元数据过滤">
+                      {filterEntries.length === 0
+                        ? "无"
+                        : filterEntries.map(([key, value]) => `${key}=${String(value)}`).join(", ")}
+                    </Row>
+                  </div>
+                </PanelSection>
 
-            <PanelSection label="通道命中（融合前候选）">
-              <div className="space-y-1">
-                {trace.channels.map((channel) => (
-                  <BarRow
-                    key={channel.name}
-                    label={channel.label}
-                    value={channel.hits}
-                    max={maxHits}
-                    display={String(channel.hits)}
-                  />
-                ))}
-              </div>
-              {trace.channels.some((channel) => channel.detail) ? (
-                <ul className="mt-1 space-y-0.5">
-                  {trace.channels
-                    .filter((channel) => channel.detail)
-                    .map((channel) => (
-                      <li key={channel.name} className="text-meta text-muted-foreground">
-                        {channel.label}：{channel.detail}
-                      </li>
+                <PanelSection label="生效特性">
+                  <div className="flex flex-wrap gap-1">
+                    {trace.applied.length === 0 ? (
+                      <span className="text-meta text-muted-foreground">无（仅向量通道）</span>
+                    ) : (
+                      trace.applied.map((name) => (
+                        <Chip key={name} tone="primary">
+                          {featureLabel(name)}
+                        </Chip>
+                      ))
+                    )}
+                  </div>
+                </PanelSection>
+
+                {trace.skipped.length > 0 ? (
+                  <PanelSection label={`未生效（${trace.skipped.length}）`}>
+                    <ul className="space-y-1.5">
+                      {trace.skipped.map((item) => (
+                        <li key={item.name} className="rounded-md bg-muted/50 px-2 py-1.5">
+                          <p className="text-meta font-medium text-warning">{featureLabel(item.name)}</p>
+                          <p className="mt-0.5 text-meta leading-snug text-muted-foreground">{item.reason}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  </PanelSection>
+                ) : null}
+
+                <PanelSection label="规划输出">
+                  <div className="flex flex-wrap gap-1">
+                    <Chip title={trace.plan.subs.join("\n") || undefined}>子问题 ×{trace.plan.subs.length}</Chip>
+                    <Chip>退步 ×{trace.plan.step_back ? 1 : 0}</Chip>
+                    <Chip>HyDE ×{trace.plan.hyde ? 1 : 0}</Chip>
+                    <Chip title={trace.plan.rewritten ?? undefined}>改写 ×{trace.plan.rewritten ? 1 : 0}</Chip>
+                    <Chip>查询 ×{trace.plan.queries.length}</Chip>
+                  </div>
+                  {trace.plan.subs.length > 0 ? (
+                    <ol className="mt-1.5 space-y-1 text-meta leading-snug text-muted-foreground">
+                      {trace.plan.subs.slice(0, 5).map((sub, index) => (
+                        <li key={index} className="line-clamp-2">
+                          {index + 1}. {sub}
+                        </li>
+                      ))}
+                    </ol>
+                  ) : null}
+                  {trace.plan.rewritten ? (
+                    <p className="mt-1 line-clamp-2 text-meta leading-snug text-muted-foreground" title={trace.plan.rewritten}>
+                      改写：{trace.plan.rewritten}
+                    </p>
+                  ) : null}
+                  {trace.plan.step_back ? (
+                    <p className="mt-1 line-clamp-2 text-meta leading-snug text-muted-foreground">
+                      退步：{trace.plan.step_back}
+                    </p>
+                  ) : null}
+                  {trace.plan.hyde ? (
+                    <details className="mt-1">
+                      <summary className="cursor-pointer text-meta text-muted-foreground">假想文档</summary>
+                      <p className="mt-1 line-clamp-6 text-meta leading-snug text-muted-foreground">{trace.plan.hyde}</p>
+                    </details>
+                  ) : null}
+                </PanelSection>
+
+                <PanelSection label="通道命中（融合前候选）">
+                  <div className="space-y-1">
+                    {trace.channels.map((channel) => (
+                      <BarRow
+                        key={channel.name}
+                        label={channel.label}
+                        value={channel.hits}
+                        max={maxHits}
+                        display={String(channel.hits)}
+                      />
                     ))}
-                </ul>
-              ) : null}
-            </PanelSection>
+                  </div>
+                  {trace.channels.some((channel) => channel.detail) ? (
+                    <ul className="mt-1 space-y-0.5">
+                      {trace.channels
+                        .filter((channel) => channel.detail)
+                        .map((channel) => (
+                          <li key={channel.name} className="text-meta text-muted-foreground">
+                            {channel.label}：{channel.detail}
+                          </li>
+                        ))}
+                    </ul>
+                  ) : null}
+                </PanelSection>
 
-            <PanelSection label="路由判定">
-              <div className="space-y-0.5">
-                <Row label="命中文档">{trace.routing.routed_docs} 篇</Row>
-                <Row label="最高分 / 阈值">
-                  {trace.routing.top_score.toFixed(3)} / {trace.routing.min_score}
-                </Row>
-                <Row label="全局兜底">{trace.routing.fallback ? "已追加" : "未追加"}</Row>
-              </div>
-            </PanelSection>
+                <PanelSection label="路由判定">
+                  <div className="space-y-0.5">
+                    <Row label="命中文档">{trace.routing.routed_docs} 篇</Row>
+                    <Row label="最高分 / 阈值">
+                      {trace.routing.top_score.toFixed(3)} / {trace.routing.min_score}
+                    </Row>
+                    <Row label="全局兜底">{trace.routing.fallback ? "已追加" : "未追加"}</Row>
+                  </div>
+                </PanelSection>
 
-            <PanelSection label="融合与重排">
-              <div className="space-y-0.5">
-                <Row label="融合输入组数">{trace.fusion.channels}</Row>
-                <Row label="融合前去重">{trace.fusion.pre_merge}</Row>
-                <Row label="融合后">{trace.fusion.post_merge}</Row>
-                {trace.fusion.rerank ? <Row label="重排">{trace.fusion.rerank}</Row> : null}
-                <Row label="最终返回">{trace.fusion.final}</Row>
-              </div>
-            </PanelSection>
+                <PanelSection label="融合与重排">
+                  <div className="space-y-0.5">
+                    <Row label="融合输入组数">{trace.fusion.channels}</Row>
+                    <Row label="融合前去重">{trace.fusion.pre_merge}</Row>
+                    <Row label="融合后">{trace.fusion.post_merge}</Row>
+                    {trace.fusion.rerank ? <Row label="重排">{trace.fusion.rerank}</Row> : null}
+                    <Row label="最终返回">{trace.fusion.final}</Row>
+                  </div>
+                </PanelSection>
 
-            <PanelSection label="耗时分解">
-              <div className="space-y-0.5">
-                <Row label="规划">{formatMs(trace.timings.plan_ms)}</Row>
-                <Row label="检索">{formatMs(trace.timings.retrieve_ms)}</Row>
-                <Row label="生成">{formatMs(trace.timings.generate_ms)}</Row>
-              </div>
-            </PanelSection>
+                <PanelSection label="耗时分解">
+                  <div className="space-y-0.5">
+                    <Row label="规划">{formatMs(trace.timings.plan_ms)}</Row>
+                    <Row label="检索">{formatMs(trace.timings.retrieve_ms)}</Row>
+                    <Row label="生成">{formatMs(trace.timings.generate_ms)}</Row>
+                  </div>
+                </PanelSection>
+              </>
+            ) : null}
           </>
-        ) : null}
+        )}
 
         {sources.length > 0 ? (
           <PanelSection label={`证据（${sources.length}）`}>

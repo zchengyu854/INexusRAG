@@ -7,6 +7,7 @@ import { SourcePreview } from "@/components/documents/source-preview"
 import { Button } from "@/components/ui/button"
 import { Metric } from "@/components/ui/metric"
 import {
+  buildDocumentGraph,
   getChunks,
   previewRechunk,
   rechunkDocument,
@@ -45,6 +46,8 @@ export function DocumentDetail({
   const [previewLoading, setPreviewLoading] = useState(false)
   const [rechunkResult, setRechunkResult] = useState<RechunkResult | null>(null)
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
+  const [graphBuilding, setGraphBuilding] = useState(false)
+  const [graphMessage, setGraphMessage] = useState<string | null>(null)
 
   const loadChunks = useCallback(async () => {
     setLoading(true)
@@ -97,6 +100,20 @@ export function DocumentDetail({
     }
   }
 
+  async function handleBuildGraph() {
+    setGraphBuilding(true)
+    setGraphMessage(null)
+    setError(null)
+    try {
+      const result = await buildDocumentGraph(doc.id)
+      setGraphMessage(result.message || "已开始后台建图")
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "建图失败")
+    } finally {
+      setGraphBuilding(false)
+    }
+  }
+
   const activeChunk = activeIndex != null ? chunks.find((chunk) => chunk.index === activeIndex) ?? null : null
 
   return (
@@ -114,7 +131,23 @@ export function DocumentDetail({
             <RefreshCw className={cn(loading && "animate-spin")} />
             刷新
           </Button>
+          <Button
+            variant="outline"
+            size="xs"
+            onClick={() => void handleBuildGraph()}
+            disabled={graphBuilding || doc.status !== "ready" || totalChunks === 0}
+            title="按本文档增量抽取实体关系（不清空其他文档的图）"
+          >
+            {graphBuilding ? <RefreshCw className="animate-spin" /> : null}
+            构建图谱
+          </Button>
         </div>
+
+        {graphMessage ? (
+          <p className="mb-3 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-body text-muted-foreground">
+            {graphMessage}
+          </p>
+        ) : null}
 
         {error ? (
           <p className="mb-3 rounded-md border border-destructive/30 px-2.5 py-1.5 text-body text-destructive">
