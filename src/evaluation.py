@@ -46,13 +46,19 @@ def add_case(question: str, expected_refs: str, reference_answer: str | None = N
     return int(row["id"])
 
 
-def load_cases() -> list[dict]:
-    """评测例列表。expected 为 'doc_name:chunk_index' 集合，expected_refs 保留原始串供 API 回显。"""
-    ensure_table()
-    with connection() as conn:
-        rows = list(conn.execute(
-            "SELECT id, question, expected_refs, reference_answer FROM eval_cases ORDER BY id"
-        ))
+def load_cases(conn: Any | None = None) -> list[dict]:
+    """评测例列表。expected 为 'doc_name:chunk_index' 集合，expected_refs 保留原始串供 API 回显。
+
+    传入 conn 时复用调用方事务：批量改写引用的脚本必须在同一事务内读到自己的写入，
+    否则后一篇文档会基于旧值重写、覆盖前一篇的结果。
+    """
+    if conn is None:
+        ensure_table()
+        with connection() as own:
+            return load_cases(own)
+    rows = list(conn.execute(
+        "SELECT id, question, expected_refs, reference_answer FROM eval_cases ORDER BY id"
+    ))
     return [
         {
             "id": r["id"],
@@ -63,6 +69,37 @@ def load_cases() -> list[dict]:
         }
         for r in rows
     ]
+
+
+def update_expected_refs(case_id: int, expected_refs: str, conn: Any | None = None) -> None:
+    """改写某条评测例的引用；传入 conn 时并入调用方事务。"""
+    if conn is not None:
+        conn.execute("UPDATE eval_cases SET expected_refs = %s WHERE id = %s", [expected_refs, case_id])
+        return
+    with connection() as own:
+        own.execute("UPDATE eval_cases SET expected_refs = %s WHERE id = %s", [expected_refs, case_id])
+
+
+def remap_expected_refs(refs: str, doc_name: str, mapping: dict[int, int]) -> str:
+    """把 expected_refs 里指定文档的 chunk_index 按下标映射重写（去重保序）。
+
+    存量去重会重排 chunk_index；被删掉的重复切片内容仍存在于保留块中，
+    因此把旧下标映射到保留块的新下标，评测口径就不会因为清理而失效。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (refs or "").split("|"):
+        ref = raw.strip()
+        if not ref:
+            continue
+        name, sep, index = ref.rpartition(":")
+        if sep and name == doc_name and index.isdigit():
+            index = str(mapping.get(int(index), int(index)))
+            ref = f"{name}:{index}"
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return "|".join(out)
 
 
 def retrieval_metrics(results: list[dict], expected: set[str], k: int) -> dict:

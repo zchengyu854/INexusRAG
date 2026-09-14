@@ -4,6 +4,7 @@ from unittest.mock import patch
 from src.evaluation import (
     _normalize_runner_out,
     agent_runner,
+    remap_expected_refs,
     retrieval_metrics,
     run_ablation,
 )
@@ -62,6 +63,32 @@ class AblationRunnerTests(unittest.TestCase):
             out = agent_runner("q", 5, None)
         self.assertEqual(out["results"], [])
         self.assertTrue(out["cost"]["fallback"])
+
+
+class RemapExpectedRefsTests(unittest.TestCase):
+    """去重后重排 chunk_index，评测引用要跟着映射，口径才不变。"""
+
+    def test_maps_only_the_target_document(self):
+        refs = "RAG.pdf:10|other.md:3"
+        self.assertEqual(
+            remap_expected_refs(refs, "RAG.pdf", {10: 4}),
+            "RAG.pdf:4|other.md:3",
+        )
+
+    def test_deleted_duplicate_points_at_the_kept_chunk(self):
+        # 旧下标 7 是被删的重复块，内容保留在新下标 2
+        self.assertEqual(remap_expected_refs("RAG.pdf:7", "RAG.pdf", {7: 2}), "RAG.pdf:2")
+
+    def test_unknown_index_is_left_untouched(self):
+        self.assertEqual(remap_expected_refs("RAG.pdf:99", "RAG.pdf", {7: 2}), "RAG.pdf:99")
+
+    def test_mapping_collisions_are_deduped(self):
+        refs = "RAG.pdf:7|RAG.pdf:9"
+        self.assertEqual(remap_expected_refs(refs, "RAG.pdf", {7: 2, 9: 2}), "RAG.pdf:2")
+
+    def test_empty_and_malformed_refs_survive(self):
+        self.assertEqual(remap_expected_refs("", "RAG.pdf", {}), "")
+        self.assertEqual(remap_expected_refs("no-colon", "RAG.pdf", {1: 0}), "no-colon")
 
 
 if __name__ == "__main__":

@@ -57,7 +57,7 @@ from src.evaluation import (
     run_ablation,
 )
 from src.ingestion.embedder import get_embedder
-from src.ingestion.splitter import split_document
+from src.ingestion.splitter import dedupe_chunks, split_document
 from src.llm.client import LLMClient, get_llm
 from src.retrieval import index_document_route, multi_query_search
 from src.storage.database import (
@@ -133,12 +133,12 @@ def _source_path(doc: dict) -> Path:
 
 
 def _read_and_split(doc: dict, config: DocConfig):
-    chunks = split_document(
+    chunks = dedupe_chunks(split_document(
         _source_path(doc),
         doc_name=doc["filename"],
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
-    )
+    ))
     if not chunks:
         raise ValueError("切片后无有效内容")
     return chunks

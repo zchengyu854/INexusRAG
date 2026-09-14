@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -320,6 +320,37 @@ def split_pdf_file(path: str | Path, doc_name: str | None = None, include_images
     finally:
         doc.close()
     return result
+
+
+def chunk_key(text: str) -> str:
+    """切片去重键：折叠空白后的文本。
+
+    ingest 阶段的 dedupe_chunks 与存量清理脚本 scripts/dedupe_chunks.py 共用，
+    保证「入库时去重」和「历史数据清理」用的是同一套判定口径。
+    """
+    return " ".join((text or "").split())
+
+
+def dedupe_chunks(chunks: list[Chunk]) -> list[Chunk]:
+    """去掉内容完全相同的重复切片（保留首次出现），并重排 chunk_id。
+
+    源文档常自带多份相同内容（例如把同一部法律条文粘贴了三遍）：这些切片内容一模一样，
+    却会一起挤进检索候选、互相稀释 RRF 名次，还白占 embedding 与存储。
+    按 chunk_key 归一化后去重，因此仅差空格/换行的副本也会被合并。
+    """
+    seen: set[str] = set()
+    kept: list[Chunk] = []
+    for chunk in chunks:
+        key = chunk_key(chunk.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        kept.append(chunk)
+    if not kept:
+        return kept
+    doc_name = kept[0].doc_name
+    # 重排 id 使 "{doc_name}-{index}" 与去重后的顺序一致，避免留下空洞下标
+    return [replace(chunk, chunk_id=f"{doc_name}-{index}") for index, chunk in enumerate(kept)]
 
 
 def split_document(path: str | Path, **kwargs) -> list[Chunk]:
