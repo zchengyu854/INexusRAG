@@ -149,5 +149,54 @@ class EvaluateAnswersTests(unittest.TestCase):
         self.assertEqual(len(saved), 2)                  # 两例都落库
 
 
+    def test_config_mode_overrides_default(self):
+        """三项形式 (label, features, mode) 必须真的切换范式，不能只换标签。"""
+        from src.evaluation import evaluate_answers
+
+        cases = [{"id": 1, "question": "q1", "reference_answer": "r1", "expected": set()}]
+        seen: list = []
+        with patch("src.evaluation.load_cases", return_value=cases), \
+             patch("src.judge.generate_answer",
+                   side_effect=lambda q, **kw: (seen.append(kw.get("mode")), {"answer": "a", "sources": []})[1]), \
+             patch("src.judge.judge_faithfulness", return_value=None), \
+             patch("src.judge.judge_correctness", return_value=None), \
+             patch("src.judge.save_result", return_value=None):
+            evaluate_answers(
+                configs=[("a", None, "pipeline"), ("b", None, "agent")],
+                llm=FakeJudgeLLM(),
+            )
+        self.assertEqual(seen, ["pipeline", "agent"])
+
+
+    def test_generation_failure_does_not_abort_the_run(self):
+        """单例生成失败（余额不足/限流）要记录并继续，不能丢掉整轮结果。"""
+        from src.evaluation import evaluate_answers
+
+        cases = [
+            {"id": 1, "question": "q1", "reference_answer": "r1", "expected": set()},
+            {"id": 2, "question": "q2", "reference_answer": "r2", "expected": set()},
+        ]
+        calls = {"n": 0}
+
+        def flaky(question, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("402 Insufficient Balance")
+            return {"answer": "a", "sources": []}
+
+        with patch("src.evaluation.load_cases", return_value=cases), \
+             patch("src.judge.generate_answer", side_effect=flaky), \
+             patch("src.judge.judge_faithfulness", return_value={"score": 0.5, "claim_count": 2,
+                                                                 "unsupported_count": 1, "unsupported_claims": ["x"]}), \
+             patch("src.judge.judge_correctness", return_value={"score": 0.5, "verdict": "partial"}), \
+             patch("src.judge.save_result", return_value=None):
+            out = evaluate_answers(run_label="t", llm=FakeJudgeLLM())
+
+        self.assertEqual(out[0]["failed"], 1)          # 记下了失败
+        self.assertEqual(out[0]["judged"], 1)          # 成功的那例照常统计
+        self.assertEqual(out[0]["faithfulness"], 0.5)
+        self.assertIn("402", out[0]["failures"][0]["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

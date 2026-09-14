@@ -330,17 +330,21 @@ def seed_reference_answers() -> int:
 
 
 def evaluate_answers(
-    configs: list[tuple[str, list[str] | None]] | None = None,
+    configs: list[tuple] | None = None,
     run_label: str = "default",
     limit: int | None = None,
     top_k: int = 5,
     mode: str = "pipeline",
+    agent_max_steps: int = 6,
     llm: Any | None = None,
 ) -> list[dict]:
     """答案级评测：逐例生成回答 → 判忠实度/正确性 → 落库并汇总。
 
     与检索级 run_ablation 的分工：那里回答「资料找没找到」，这里回答「回答有没有胡说」。
     忠实度取「被来源支撑的论断占比」，直接量化幻觉；正确性需要 reference_answer。
+
+    configs 项为 (label, features) 或 (label, features, mode)——三项形式可让不同配置
+    使用不同检索范式（pipeline / agent），否则会出现「标签写着 agent、实际跑的是管线」。
     """
     from src.judge import generate_answer, judge_correctness, judge_faithfulness, save_result
 
@@ -351,14 +355,28 @@ def evaluate_answers(
         configs = [("pipeline(含改写)", None)]
 
     summary: list[dict] = []
-    for label, features in configs:
+    for item in configs:
+        if len(item) == 3:
+            label, features, config_mode = item
+        else:
+            label, features = item
+            config_mode = mode
         faith_sum = corr_sum = 0.0
         faith_n = corr_n = 0
         unsupported_total = 0
+        failures: list[dict] = []
         for case in cases:
-            generated = generate_answer(
-                case["question"], top_k=top_k, features=features, mode=mode, llm=llm
-            )
+            try:
+                generated = generate_answer(
+                    case["question"], top_k=top_k, features=features,
+                    mode=config_mode, max_steps=agent_max_steps, llm=llm,
+                )
+            except Exception as exc:
+                # 单例失败（余额不足 / 限流 / 网关故障）不该让整轮评测崩掉：
+                # 记下来继续跑，最后汇总失败数——否则一次 402 就丢掉全部已跑结果。
+                failures.append({"case_id": case["id"], "error": f"{type(exc).__name__}: {exc}"})
+                print(f"  [{label}] #{case['id']} 生成失败：{type(exc).__name__}", flush=True)
+                continue
             answer, sources = generated["answer"], generated["sources"]
             faith = judge_faithfulness(case["question"], answer, sources, llm=llm)
             correct = judge_correctness(case["question"], answer, case["reference_answer"], llm=llm)
@@ -383,6 +401,9 @@ def evaluate_answers(
             "faithfulness": round(faith_sum / faith_n, 4) if faith_n else None,
             "correctness": round(corr_sum / corr_n, 4) if corr_n else None,
             "unsupported_claims": unsupported_total,
+            "judged": faith_n,
+            "failed": len(failures),
+            "failures": failures,
         })
     return summary
 
@@ -422,15 +443,21 @@ def main() -> None:
         if not load_cases():
             print("eval_cases 为空，先 add 评测例")
             return
-        configs: list[tuple[str, list[str] | None]] = [("pipeline(含改写)", None)]
+        configs: list[tuple] = [("pipeline(含改写)", None, "pipeline")]
         if ns.agent:
-            configs.append((f"agent(steps={ns.agent_steps})", None))
+            # 必须带上 mode，否则只是换了个标签、实际仍在跑管线
+            configs.append((f"agent(steps={ns.agent_steps})", None, "agent"))
         print(f"答案级评测 label={ns.label} limit={ns.limit or '全部'}")
-        for row in evaluate_answers(configs=configs, run_label=ns.label, limit=ns.limit, top_k=ns.k):
+        for row in evaluate_answers(
+            configs=configs, run_label=ns.label, limit=ns.limit, top_k=ns.k,
+            agent_max_steps=ns.agent_steps,
+        ):
             print(
                 f"{row['label']:<24} cases={row['cases']:<3} "
                 f"faithfulness={row['faithfulness']} correctness={row['correctness']} "
                 f"未支撑论断={row['unsupported_claims']}"
+                + (f" | 判官样本={row['judged']}" if row.get("judged") else "")
+                + (f" 失败={row['failed']}" if row.get("failed") else "")
             )
         return
 

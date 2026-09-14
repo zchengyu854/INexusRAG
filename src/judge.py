@@ -193,6 +193,7 @@ def generate_answer(
     top_k: int = 5,
     features: list[str] | None = None,
     mode: str = "pipeline",
+    max_steps: int = 6,
     llm: Any | None = None,
 ) -> dict:
     """跑完整问答链路（检索 + 生成），返回 {answer, sources}。
@@ -208,7 +209,7 @@ def generate_answer(
         try:
             from src.agent import run_agent
 
-            out = run_agent(question, top_k=top_k, features=features)
+            out = run_agent(question, top_k=top_k, features=features, max_steps=max_steps)
             if out is not None:
                 sources = out["results"]
         except Exception:
