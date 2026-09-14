@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import jieba
 
@@ -12,16 +14,21 @@ from src.storage.database import keyword_chunks, search_chunks, search_doc_index
 _JUNK = set((
     "的 了 吗 呢 啊 吧 么 是 在 有 和 与 或 及 着 被 把 对 向 于 从 到 "
     "什么 怎么 如何 哪些 哪个 为什么 可以 能否 是否 这个 那个 一个 我们 你们 他们 你 我"
+    "条是 个是 个有"
 ).split())
 _ASCII = re.compile(r"[0-9A-Za-z]")
 _CJK = re.compile(r"[\u4e00-\u9fff]+\Z")
+# 句尾疑问/修辞后缀：jieba 会把 "条是什么" 切成 ["条是", "什么"]， both 过滤后仍漏 "条是"；
+# 预处理直接抹掉这类后缀及其后的标点，减少对关键词通道的污染。
+_QUESTION_SUFFIXES = re.compile(r"(?:是什么|是多少|有哪些|是什么东西|怎么样|行吗|对吗|吗|呢|吧|啊|么)[^A-Za-z0-9\u4e00-\u9fff]*$")
 
 
 def extract_terms(question: str, max_terms: int = 12) -> list[str]:
-    """从问题中提取关键词：jieba 分词 + 数字/字母串，去掉停用词和单字。"""
+    """从问题中提取关键词：jieba 分词 + 数字/字母串，去掉停用词、单字和句尾疑问后缀。"""
+    cleaned = _QUESTION_SUFFIXES.sub("", question)
     terms: list[str] = []
     seen: set[str] = set()
-    for token in jieba.lcut(question):
+    for token in jieba.lcut(cleaned):
         token = token.strip()
         if len(token) < 2 or token in _JUNK:
             continue
@@ -36,16 +43,143 @@ def extract_terms(question: str, max_terms: int = 12) -> list[str]:
 
 
 def rrf_merge(channels: list[list[dict]], top_k: int, k: int = 60) -> list[dict]:
-    """RRF 融合多个有序结果通道，返回带融合分的行（按 chunk_id 去重）。"""
+    """RRF 融合多个有序结果通道，返回带融合分的行（按 chunk_id 去重）。
+
+    同时保留每个 chunk 的最佳向量余弦分（vector_score），供后续相关性阈值过滤使用。
+    关键词通道没有向量分（视为 0.0），靠精确命中保命。
+    """
     scores: dict[str, float] = {}
     rows: dict[str, dict] = {}
+    vector_scores: dict[str, float] = {}
     for channel in channels:
         for rank, row in enumerate(channel):
             key = row["chunk_id"]
             rows.setdefault(key, row)
             scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            # vector_score 已存在则复用（来自 two_stage_search 的二次融合），否则取当前 score（cosine）
+            vector_scores[key] = max(
+                vector_scores.get(key, 0.0),
+                row.get("vector_score") if row.get("vector_score") is not None else row.get("score", 0.0),
+            )
     ranked = sorted(scores, key=scores.get, reverse=True)[:top_k]
-    return [dict(rows[key], score=round(scores[key], 6)) for key in ranked]
+    return [dict(rows[key], score=round(scores[key], 6), vector_score=round(vector_scores[key], 6)) for key in ranked]
+
+
+# 纯数字串作为查询词时召回太宽泛（如 "230" 会命中体育赔率、页码等），
+# 不能单独作为 coverage 依据，需要配合向量分阈值或非数字实体词。
+_PURE_NUMBER = re.compile(r"^[0-9]+$")
+# 对 bge-m3 余弦分实测：无相关实体的查询约 0.40–0.45，相关查询通常 > 0.50。
+_MIN_RELEVANCE_SCORE = 0.45
+# 完整法条编号（如 '第二百三十条' / '第230条'）：带 '第…条' 边界，比 extract_terms 切出的
+# '二百三十' 更精确——'第一千二百三十条' 是 '一' + '千二百三十条'，并不包含子串 '第二百三十条'，
+# 因此套上边界后可排除同数字串污染。
+_ARTICLE_RE = re.compile(r"第[一二三四五六七八九十百千零两0-9]+条")
+# 用户常省略 '第'（如 "民法典的二百三十条"），补回 '第' 还原成规范法条串再做精确匹配。
+# 仅接受含 百/千/十 或长度≥2 的中文数字串 + 条，避免把 '一条鱼' 这类量词误当法条。
+# 负向后查同时排除阿拉伯数字与中文数字，避免 "第二百三十条" 内部的 "百三十条" 被重复截取成 "第百三十条"。
+_ARTICLE_NO_LEAD_RE = re.compile(
+    r"(?<!第)(?<![0-9一二三四五六七八九十百千零两])((?:[一二三四五六七八九十百千零两]*[百千万][一二三四五六七八九十百千零两]*|[一二三四五六七八九十百千零两]{2,})条)"
+)
+
+
+def _extract_article_terms(question: str) -> list[str]:
+    """从问题中提取完整法条编号字符串（带 '第…条' 边界）。
+
+    用于精确匹配，避免 extract_terms 切出的 '二百三十' 误命中 '第一千二百三十条' 这类同数字串。
+    查询省略 '第' 时（"二百三十条"）会自动补成 '第二百三十条' 再匹配。
+    """
+    cleaned = _QUESTION_SUFFIXES.sub("", question)
+    found: list[str] = list(_ARTICLE_RE.findall(cleaned))
+    for m in _ARTICLE_NO_LEAD_RE.findall(cleaned):
+        found.append("第" + m)
+    # 去重保序
+    return list(dict.fromkeys(found))
+
+
+def inject_article_channel(question: str, merged: list[dict], top_k: int) -> list[dict]:
+    """法条编号精确通道：把"第二百三十条"这类精确法条切片补进候选集。
+
+    让相关性过滤能优先返回真法条，避免被向量通道排在前面的"第二百三十七条 /
+    第一千二百三十条"等同数字串挤掉。仅当问题含法条编号时生效，不影响普通查询。
+    multi_query_search 与 agent 的 search_knowledge 工具共用，保证两条范式行为一致。
+    """
+    article_terms = _extract_article_terms(question)
+    if not article_terms:
+        return merged
+    injected = keyword_chunks(article_terms, limit=max(top_k * 5, 25))
+    if injected:
+        seen_ids = {r["chunk_id"] for r in merged}
+        for r in injected:
+            if r["chunk_id"] not in seen_ids:
+                r.setdefault("vector_score", 0.0)
+                merged.append(r)
+    return merged
+
+
+def rewrite_query(question: str) -> str:
+    """检索友好的查询改写（确定性，无需 LLM，永远在线）：
+
+    1) 去掉句尾疑问/修辞后缀（避免「是什么」参与向量召回稀释语义）；
+    2) 归一法条编号为带「第…条」边界的规范串；
+    3) 用实体词 + 法条串拼接待检索查询，剔除纯数字噪声词。
+
+    改写只在能提取到有效实体/法条时生效，否则返回原查询，避免画蛇添足。
+    这是针对 bge-m3 模糊性的核心兜底：原问题「民法典的二百三十条是什么？」经 embedding
+    后会被判为与「第一千二百三十条」高度相似；改写为「民法典 第二百三十条」后向量通道才能
+    精准命中，配合 _extract_article_terms 注入的关键词通道形成「向量 + 精确」双保险。
+
+    例：
+      '民法典的二百三十条是什么？' -> '民法典 二百三十 第二百三十条'
+      'RAG 是什么'                -> 'RAG'   （去后缀，无实体可补）
+      '你好'                      -> '你好'  （无实体/法条，原样）
+    """
+    terms = [t for t in extract_terms(question) if not _PURE_NUMBER.match(t)]
+    articles = _extract_article_terms(question)
+    if not terms and not articles:
+        return question
+    # 实体词在前、法条串在后，去重保序
+    parts = list(dict.fromkeys(terms + articles))
+    return " ".join(parts)
+
+
+def _relevance_filter(results: list[dict], question: str) -> list[dict]:
+    """相关性过滤：分三档精确匹配，最后才退回向量分阈值。
+
+    匹配优先级（命中即返回该档）：
+      1) 实体词 + 完整法条编号 全部命中（最精确）；
+      2) 仅完整法条编号命中（容忍切片未出现知识库名/实体词，如切片只写 '第二百三十条'）；
+      3) 仅实体词命中（容忍法条编号写法差异，如 '第二百三十条' vs '第230条'）；
+      — 以上皆无全命中时，看向量余弦最高分：≥ 阈值则保留，否则清空（防止 LLM 基于噪声幻觉）。
+
+    典型场景：
+    - 问"民点发的230条"，知识库没有"民点"，向量靠"230"捞出体育赔率等噪声 → 清空。
+    - 问"民法典的二百三十条"，最相关切片（#21/#50）未排第一；第 1 档 AND 过滤可去掉只含"民法典"
+      但不含"二百三十"的通用切片（#0），显著降低 hallucination。
+    - 第 2 档法条边界可排除"第一千二百三十条"：'第二百三十条' 不是 '第一千二百三十条' 的子串，
+      因此错误法条不会被同数字串卷进来。
+    """
+    if not results:
+        return results
+    terms = [t for t in extract_terms(question) if not _PURE_NUMBER.match(t)]
+    articles = _extract_article_terms(question)
+    if not terms and not articles:
+        return results
+    exact_terms = terms + articles
+    exact = [row for row in results if all(t in row.get("text", "") for t in exact_terms)]
+    if exact:
+        return exact
+    if articles:
+        exact_art = [row for row in results if all(a in row.get("text", "") for a in articles)]
+        if exact_art:
+            return exact_art
+    if terms:
+        exact_loose = [row for row in results if all(t in row.get("text", "") for t in terms)]
+        if exact_loose:
+            return exact_loose
+    max_vector = max(row.get("vector_score", 0.0) for row in results)
+    if max_vector >= _MIN_RELEVANCE_SCORE:
+        return results
+    return []
 
 
 def build_routing_summary(filename: str, chunks: list) -> str:
@@ -72,14 +206,15 @@ def index_document_route(doc_id: str, doc_name: str, chunks: list, encode) -> No
 
 
 _ROUTE_TOP = 3
-# 路由置信度不足时补一路全局向量兜底。
+# 路由置信度不足时走全局向量（不再同时扫路由文档，避免「兜底常开 + 错文档通道」双倍开销）。
 # 校准（2026-09-11，8 篇文档 / 7077 切片 / bge-m3 1024 维，脚本 scripts/calibrate_thresholds.py）：
 # 查询路由 top-1 分数实测落在 0.296–0.660（中位 0.497），且全局兜底通道在每一档阈值上
 # 都提升召回——阈值从 0.30 提到 0.70，三个独立评测集上的变化是
 # 段落查询(n=120) Hit@5 57%→88%、首句查询(n=71) 44%→69%、手写查询(n=32) MRR 0.678→0.932。
 # 也就是说这个阈值的最优解是「兜底常开」：路由一次取 3 篇、其中往往 2 篇是错的，
 # 少了全局通道，正确切片在 RRF 里会被错误文档的并列第一压掉。
-# 0.70 取在实测最大值之上，等价于兜底常开；换语料或换 embedding 后重跑校准脚本再调。
+# 0.70 取在实测最大值之上，等价于兜底常开；此时跳过 per-doc 扫描（否则 3 路错文档 + 1 路全局）。
+# 仅当 top-1 ≥ 阈值时才做文档内检索。换语料或换 embedding 后重跑校准脚本再调。
 _MIN_ROUTE_SCORE = 0.70
 
 
@@ -93,47 +228,62 @@ def two_stage_search(
 ) -> list[dict]:
     """两级检索：先路由命中目标文档，再在目标文档内检索；关键词通道全局兑底。use_routing=False 时只做全局向量检索。
 
+    路由 top-1 < 阈值时只跑全局向量（不叠加 per-doc），避免常开兜底下的冗余 ANN。
     stats 为可选的出参字典，仅在需要观测时传入（用于 /api/query 的 debug trace）。
     传 None 时全部记账代码被跳过，检索路径与不传时完全一致。
     """
     limit = max(top_k * 5, 25)
     channels: list[list[dict]] = []
+    lock = stats.get("_lock") if stats is not None else None
+
+    def _bump(key: str, n: int) -> None:
+        if stats is None:
+            return
+        if lock is not None:
+            with lock:
+                stats[key] = stats.get(key, 0) + n
+        else:
+            stats[key] = stats.get(key, 0) + n
+
     if terms:
         keyword_rows = keyword_chunks(terms, limit=limit, filters=filters)
-        if stats is not None:
-            stats["keywords"] = stats.get("keywords", 0) + len(keyword_rows)
+        _bump("keywords", len(keyword_rows))
         channels.append(keyword_rows)
     if not use_routing:
         vector_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
-        if stats is not None:
-            stats["vector"] = stats.get("vector", 0) + len(vector_rows)
+        _bump("vector", len(vector_rows))
         channels.append(vector_rows)
         return rrf_merge(channels, top_k) if channels else []
     routed = search_doc_index(query_embedding, top_k=_ROUTE_TOP)
     if stats is not None:
         # 多查询时每条查询各自路由，这里按 doc_id 去重统计，避免「命中 8 篇文档」式的误读
-        stats.setdefault("route_top_score", round(float(routed[0]["score"]), 4) if routed else 0.0)
-        stats.setdefault("route_fallback", False)
-        stats.setdefault("routed_doc_ids", set()).update(row["doc_id"] for row in routed)
-    if routed:
+        def _note_route() -> None:
+            stats.setdefault("route_top_score", round(float(routed[0]["score"]), 4) if routed else 0.0)
+            stats.setdefault("route_fallback", False)
+            stats.setdefault("routed_doc_ids", set()).update(row["doc_id"] for row in routed)
+
+        if lock is not None:
+            with lock:
+                _note_route()
+        else:
+            _note_route()
+    top_score = float(routed[0]["score"]) if routed else 0.0
+    if routed and top_score >= _MIN_ROUTE_SCORE:
+        # 路由足够自信：只在命中文档内检索
         for row in routed:
             doc_rows = search_chunks(query_embedding, top_k=limit, doc_id=row["doc_id"], filters=filters)
-            if stats is not None:
-                stats["vector"] = stats.get("vector", 0) + len(doc_rows)
+            _bump("vector", len(doc_rows))
             channels.append(doc_rows)
-        if routed[0]["score"] < _MIN_ROUTE_SCORE:
-            # 路由置信度不足，补一路全局向量兜底
-            fallback_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
-            if stats is not None:
-                stats["vector"] = stats.get("vector", 0) + len(fallback_rows)
-                stats["route_fallback"] = True
-            channels.append(fallback_rows)
     else:
-        # 路由层没有命中任何文档（如 doc_index 为空），退回全局向量
+        # 无命中，或置信不足：全局向量一路即可（不再叠加常错的 per-doc 通道）
         fallback_rows = search_chunks(query_embedding, top_k=limit, filters=filters)
+        _bump("vector", len(fallback_rows))
         if stats is not None:
-            stats["vector"] = stats.get("vector", 0) + len(fallback_rows)
-            stats["route_fallback"] = True
+            if lock is not None:
+                with lock:
+                    stats["route_fallback"] = True
+            else:
+                stats["route_fallback"] = True
         channels.append(fallback_rows)
     if not channels:
         return []
@@ -190,8 +340,8 @@ def plan_question(question: str) -> dict:
         return empty
 
 
-ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rerank", "graph")
-_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde")  # rerank/graph 默认关，消融时显式传 features
+ALL_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rewrite", "rerank", "graph")
+_DEFAULT_FEATURES = ("routing", "keywords", "decompose", "stepback", "hyde", "rewrite")  # rerank/graph 默认关，消融时显式传 features
 
 
 def multi_query_search(
@@ -228,38 +378,66 @@ def multi_query_search(
     step_back_used = bool("stepback" in requested and plan["step_back"] and plan["step_back"] != question)
     if step_back_used:
         queries.append(plan["step_back"])
-    vectors = get_embedder().encode(queries)
+    # 查询改写通道：把原问题归一为检索友好的规范查询（去后缀/归一法条/拼实体词），
+    # 作为额外向量+关键词通道并入 RRF。确定性实现，不依赖 LLM，网关抽风也不影响。
+    rewrite_used = bool("rewrite" in requested)
+    rewritten = rewrite_query(question) if rewrite_used else question
+    rewrite_applied = rewrite_used and rewritten != question
+    if rewrite_applied:
+        queries.append(rewritten)
+    hyde_used = bool("hyde" in requested and plan["hyde"])
+    encode_inputs = list(queries)
+    if hyde_used:
+        encode_inputs.append(plan["hyde"])
+    all_vectors = get_embedder().encode(encode_inputs)
+    vectors = all_vectors[: len(queries)]
+    hyde_vec = all_vectors[len(queries)] if hyde_used else None
     use_routing = "routing" in requested
     # 仅 debug 时记账；传 None 会让 two_stage_search 跳过全部计数代码
-    stats: dict | None = {} if debug else None
+    stats: dict | None = {"_lock": threading.Lock()} if debug else None
 
-    def _search(query: str, vector: list[float]) -> list[dict]:
+    def _search(query: str, vector: list[float], terms: list[str] | None = None) -> list[dict]:
         return two_stage_search(
             vector, top_k=top_k,
-            terms=(extract_terms(query) if "keywords" in requested else []),
+            terms=(extract_terms(query) if terms is None and "keywords" in requested else (terms or [])),
             filters=filters, use_routing=use_routing, stats=stats,
         )
 
-    channels: list[list[dict]] = []
-    primary = _search(queries[0], vectors[0])
-    channels.append(primary)
-    expanded = [_search(query, vector) for query, vector in zip(queries[1:], vectors[1:])]
-    channels.extend(expanded)
-    hyde_used = bool("hyde" in requested and plan["hyde"])
-    hyde_rows: list[dict] = []
-    if hyde_used:
-        hyde_vec = get_embedder().encode([plan["hyde"]])[0]
-        hyde_rows = two_stage_search(hyde_vec, top_k=top_k, terms=[], filters=filters, use_routing=use_routing, stats=stats)
-        channels.append(hyde_rows)
+    jobs: list[tuple[str, list[float], list[str] | None]] = [
+        (query, vector, None) for query, vector in zip(queries, vectors)
+    ]
+    if hyde_used and hyde_vec is not None:
+        jobs.append((plan["hyde"], hyde_vec, []))
+
     graph_rows: list[dict] = []
-    if "graph" in requested:
-        # 图谱通道：复用原问题的向量做实体锚点，零额外 embedding 成本
-        from src.graph import graph_channel
-        graph_rows = graph_channel(vectors[0], top_k=max(top_k * 5, 25), filters=filters)
-        channels.append(graph_rows)
+    want_graph = "graph" in requested
+    workers = min(4, max(1, len(jobs) + (1 if want_graph else 0)))
+
+    def _run_job(job: tuple[str, list[float], list[str] | None]) -> list[dict]:
+        query, vector, terms = job
+        return _search(query, vector, terms)
+
+    if workers == 1 and not want_graph:
+        channels = [_run_job(jobs[0])] if jobs else []
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            graph_future = None
+            if want_graph:
+                from src.graph import graph_channel
+                graph_future = pool.submit(
+                    graph_channel, vectors[0], max(top_k * 5, 25), filters
+                )
+            channels = list(pool.map(_run_job, jobs))
+            if graph_future is not None:
+                graph_rows = graph_future.result()
+                channels.append(graph_rows)
+    hyde_rows: list[dict] = channels[len(queries)] if hyde_used else []
     t_retrieved = _time.perf_counter() if debug else 0.0
 
     merged = rrf_merge(channels, top_k if "rerank" not in requested else top_k * 5)
+    if "keywords" in requested:
+        merged = inject_article_channel(question, merged, top_k)
+    merged = _relevance_filter(merged, question)
     fused_count = len(merged) if debug else 0
     rerank_used = False
     effective_strategy: str | None = None
@@ -293,7 +471,10 @@ def multi_query_search(
             if stats.get("route_fallback"):
                 skipped.append({
                     "name": "routing",
-                    "reason": f"最高路由分低于阈值 {_MIN_ROUTE_SCORE}，已补一路全局向量兜底",
+                    "reason": (
+                        f"最高路由分低于阈值 {_MIN_ROUTE_SCORE}，"
+                        "跳过文档内检索，仅用全局向量"
+                    ),
                 })
         else:
             skipped.append({"name": "routing", "reason": "路由层未命中任何文档（doc_index 可能为空），已退回全局向量"})
@@ -316,6 +497,14 @@ def multi_query_search(
                 "name": name,
                 "reason": "LLM 未配置，检索规划未执行" if not llm_available else absent_reason,
             })
+    if "rewrite" in requested:
+        if rewrite_applied:
+            applied.append("rewrite")
+        else:
+            skipped.append({
+                "name": "rewrite",
+                "reason": "原查询无可提取的实体/法条，改写无增益（已退回原查询）",
+            })
     if "graph" in requested:
         if graph_rows:
             applied.append("graph")
@@ -331,7 +520,7 @@ def multi_query_search(
 
     trace_channels: list[dict] = []
     if "routing" in requested:
-        note = "，已兜底全局" if stats.get("route_fallback") else ""
+        note = "，已改走全局向量" if stats.get("route_fallback") else ""
         trace_channels.append({
             "name": "routing", "label": "路由", "hits": routed_docs,
             "detail": f"命中 {routed_docs} 篇文档{note}",
@@ -363,6 +552,7 @@ def multi_query_search(
                 "step_back": plan["step_back"],
                 "hyde": plan["hyde"],
                 "queries": list(queries),
+                "rewritten": rewritten if rewrite_applied else None,
             },
             "routing": {
                 "routed_docs": routed_docs,

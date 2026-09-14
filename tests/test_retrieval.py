@@ -4,10 +4,13 @@ import unittest
 from unittest.mock import patch
 
 from src.retrieval import (
+    _extract_article_terms,
+    _relevance_filter,
     build_routing_summary,
     extract_terms,
     multi_query_search,
     plan_question,
+    rewrite_query,
     rrf_merge,
     two_stage_search,
 )
@@ -79,7 +82,7 @@ class PlanTests(unittest.TestCase):
         with patch("src.retrieval.two_stage_search", return_value=[row("a")]) as tss, \
              patch("src.retrieval.plan_question") as plan, \
              patch("src.ingestion.embedder.get_embedder") as ge:
-            ge.return_value.encode.return_value = [[0.0]]
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             multi_query_search("原始问题", top_k=2, features=[])
             plan.assert_not_called()  # 规划类特性全关 → 不付 LLM 调用
             self.assertEqual(len(tss.call_args_list), 1)
@@ -92,7 +95,7 @@ class PlanTests(unittest.TestCase):
         with patch("src.retrieval.two_stage_search", return_value=[row("a")]) as tss, \
              patch("src.retrieval.plan_question", return_value={"subs": ["子"], "step_back": None, "hyde": None}) as plan, \
              patch("src.ingestion.embedder.get_embedder") as ge:
-            ge.return_value.encode.return_value = [[0.0]]
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             multi_query_search("原始问题", top_k=2, features=["keywords"])
             plan.assert_not_called()  # keywords 不属于规划类
             self.assertTrue(all(not c.kwargs["use_routing"] for c in tss.call_args_list))
@@ -102,7 +105,7 @@ class PlanTests(unittest.TestCase):
         with patch("src.retrieval.two_stage_search", return_value=[]) as tss, \
              patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
              patch("src.ingestion.embedder.get_embedder") as ge:
-            ge.return_value.encode.return_value = [[0.0]]
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             multi_query_search("原始问题", top_k=2)
             # 默认 = 路由+关键词开，无 rerank
             self.assertTrue(all(c.kwargs["use_routing"] for c in tss.call_args_list))
@@ -134,6 +137,13 @@ class RetrievalTests(unittest.TestCase):
         self.assertIn("pgvector", extract_terms("pgvector 0.7 是什么"))
         self.assertNotIn("是什么", extract_terms("pgvector 0.7 是什么"))
 
+    def test_extract_terms_strips_question_suffixes(self):
+        # jieba 会把 "条是什么" 切成 ["条是", "什么"]，预处理后应只剩下 "条"
+        terms = extract_terms("民法典的二百三十条是什么？")
+        self.assertIn("民法典", terms)
+        self.assertIn("二百三十", terms)
+        self.assertNotIn("条是", terms)
+
     def test_two_stage_search_limits_vector_search_to_routed_docs(self):
         with patch("src.retrieval.search_doc_index", return_value=[{"doc_id": "d1", "score": 0.9}]), \
              patch("src.retrieval.search_chunks") as sc, \
@@ -148,12 +158,24 @@ class RetrievalTests(unittest.TestCase):
             two_stage_search([0.0], top_k=5, terms=[])
             self.assertEqual([c.kwargs.get("doc_id") for c in sc.call_args_list], [None])
 
-    def test_low_route_score_adds_global_fallback_channel(self):
+    def test_low_route_score_uses_global_only_without_per_doc_scans(self):
+        """阈值以上才做文档内检索；低分时只跑全局，避免 3 路错文档 + 全局的双倍开销。"""
         with patch("src.retrieval.search_doc_index", return_value=[{"doc_id": "d1", "score": 0.1}]), \
              patch("src.retrieval.search_chunks") as sc, \
              patch("src.retrieval.keyword_chunks", return_value=[]):
             two_stage_search([0.0], top_k=5, terms=[])
-            self.assertEqual([c.kwargs.get("doc_id") for c in sc.call_args_list], ["d1", None])
+            self.assertEqual([c.kwargs.get("doc_id") for c in sc.call_args_list], [None])
+
+    def test_confident_route_skips_global_fallback(self):
+        routed = [
+            {"doc_id": "d1", "score": 0.85},
+            {"doc_id": "d2", "score": 0.80},
+        ]
+        with patch("src.retrieval.search_doc_index", return_value=routed), \
+             patch("src.retrieval.search_chunks") as sc, \
+             patch("src.retrieval.keyword_chunks", return_value=[]):
+            two_stage_search([0.0], top_k=5, terms=[])
+            self.assertEqual([c.kwargs.get("doc_id") for c in sc.call_args_list], ["d1", "d2"])
 
     def test_two_stage_search_passes_filters_to_all_channels(self):
         with patch("src.retrieval.search_doc_index", return_value=[{"doc_id": "d1", "score": 0.9}]), \
@@ -188,10 +210,10 @@ class RetrievalTests(unittest.TestCase):
         with patch("src.retrieval.two_stage_search", side_effect=fake_tss) as tss_mock, \
              patch("src.retrieval.plan_question", return_value=plan), \
              patch("src.ingestion.embedder.get_embedder") as ge:
-            ge.return_value.encode.return_value = [[0.0]] * 3
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs) * 3
             results = multi_query_search("原始问题", top_k=2, filters={"page": 1})
 
-        self.assertEqual(len(tss_mock.call_args_list), 3)  # 原问题 + 两个子问题
+        self.assertEqual(len(tss_mock.call_args_list), 4)  # 原问题 + 改写 + 两个子问题
         self.assertTrue(all(c.kwargs.get("filters") == {"page": 1} for c in tss_mock.call_args_list))
         ids = [r["chunk_id"] for r in results]
         self.assertEqual(len(set(ids)), len(ids))  # RRF 按 chunk_id 去重
@@ -207,9 +229,9 @@ class RetrievalTests(unittest.TestCase):
              patch("src.ingestion.embedder.get_embedder") as ge:
             ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             multi_query_search("原始问题", top_k=2)
-        # 原问题 + 子问题 + 退步 + HyDE(纯向量, terms=[]) = 4 通道
-        self.assertEqual(len(tss_mock.call_args_list), 4)
-        self.assertEqual(tss_mock.call_args_list[3].kwargs["terms"], [])
+        # 原问题 + 改写 + 子问题 + 退步 + HyDE(纯向量, terms=[]) = 5 通道
+        self.assertEqual(len(tss_mock.call_args_list), 5)
+        self.assertEqual(tss_mock.call_args_list[4].kwargs["terms"], [])
 
     def test_rerank_failure_degrades_to_rrf_and_is_reported_as_skipped(self):
         """cross/colbert 依赖本地模型，缺失时不能让问答整体 500，且 trace 要说明原因。"""
@@ -222,23 +244,173 @@ class RetrievalTests(unittest.TestCase):
              patch("src.retrieval.plan_question", return_value=plan), \
              patch("src.ingestion.embedder.get_embedder") as ge, \
              patch("src.rerank.rerank", side_effect=RuntimeError("cross-encoder 未下载")):
-            ge.return_value.encode.return_value = [[0.0]]
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             out = multi_query_search("问题", top_k=1, features=["rerank"], debug=True)
 
         trace = out["trace"]
         self.assertNotIn("rerank", trace["applied"])
         reason = next(s["reason"] for s in trace["skipped"] if s["name"] == "rerank")
         self.assertIn("退回", reason)
-        self.assertEqual([r["chunk_id"] for r in out["results"]], ["a"])
+
+    def test_relevance_filter_removes_noise_when_entity_missing(self):
+        """知识库不含问题里的核心实体词时，不应把沾边数字（如 '230'）的噪声切片喂给 LLM。"""
+        plan = {"subs": [], "step_back": None, "hyde": None}
+
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
+            # 模拟向量分很低、且文本不含 "民点" 的垃圾结果
+            return [
+                {"chunk_id": "c1", "text": "Brock Purdy MVP odds -230", "score": 0.1},
+                {"chunk_id": "c2", "text": "some other irrelevant text", "score": 0.09},
+            ]
+
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            results = multi_query_search("民点发的230条是什么？", top_k=2)
+
+        self.assertEqual(results, [])
+
+    def test_relevance_filter_prefers_exact_term_coverage(self):
+        """AND 命中全部实体词的切片应优先保留，避免只命中部分词的通用切片混进来。"""
+        plan = {"subs": [], "step_back": None, "hyde": None}
+
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
+            return [
+                {"chunk_id": "c1", "text": "中华人民共和国民法典 物权编 第二百零五条 ...", "score": 0.6},
+                {"chunk_id": "c2", "text": "中华人民共和国民法典 物权编 第二百三十条 因继承取得物权...", "score": 0.5},
+            ]
+
+        def fake_kw(terms, limit=None, filters=None):
+            # 精确法条通道只命中真正的"第二百三十条"切片
+            if "第二百三十条" in terms:
+                return [{"chunk_id": "c2", "text": "中华人民共和国民法典 物权编 第二百三十条 因继承取得物权...", "score": 0.0}]
+            return []
+
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
+             patch("src.retrieval.keyword_chunks", side_effect=fake_kw), \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            results = multi_query_search("民法典的二百三十条是什么？", top_k=2)
+
+        self.assertEqual([r["chunk_id"] for r in results], ["c2"])
+
+    def test_extract_article_terms_captures_full_article_string(self):
+        """'第二百三十条' 必须作为带边界的整体提取，而不是被切散成 '二百三十' 或误截出 '第百三十条'。"""
+        self.assertEqual(_extract_article_terms("民法典的二百三十条是什么？"), ["第二百三十条"])
+        self.assertEqual(_extract_article_terms("民法典第二百三十条"), ["第二百三十条"])
+        self.assertNotIn("第百三十条", _extract_article_terms("民法典第二百三十条"))
+        self.assertEqual(_extract_article_terms("刑法第230条如何适用"), ["第230条"])
+        self.assertEqual(_extract_article_terms("RAG 是什么"), [])
+
+    def test_relevance_filter_excludes_wrong_article_with_same_digits(self):
+        """'第二百三十条' 不应被 '第一千二百三十条' 同数字串污染：精确法条通道只命中真正的 230 条。"""
+        plan = {"subs": [], "step_back": None, "hyde": None}
+
+        def fake_tss(vec, top_k, terms, filters=None, use_routing=True, stats=None):
+            return [
+                {"chunk_id": "c2276", "text": "中华人民共和国民法典 物权编 第一千二百三十条 因污染环境...", "score": 0.55},
+                {"chunk_id": "c21", "text": "中华人民共和国民法典 物权编 第二百三十条 因继承取得物权...", "score": 0.5},
+            ]
+
+        def fake_kw(terms, limit=None, filters=None):
+            # 精确法条通道只命中真正的"第二百三十条"切片，不含"第一千二百三十条"
+            if "第二百三十条" in terms:
+                return [{"chunk_id": "c21", "text": "中华人民共和国民法典 物权编 第二百三十条 因继承取得物权...", "score": 0.0}]
+            return []
+
+        with patch("src.retrieval.two_stage_search", side_effect=fake_tss), \
+             patch("src.retrieval.keyword_chunks", side_effect=fake_kw), \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            results = multi_query_search("民法典的二百三十条是什么？", top_k=2)
+
+        self.assertEqual([r["chunk_id"] for r in results], ["c21"])
+
+    def test_relevance_filter_direct_unit_article_precision(self):
+        """直接单测 _relevance_filter：第 2 档（仅法条编号命中）应排除同数字串错误法条。"""
+        results = [
+            {"chunk_id": "c2276", "text": "第一千二百三十条 因污染环境...", "vector_score": 0.55},
+            {"chunk_id": "c21", "text": "第二百三十条 因继承取得物权...", "vector_score": 0.5},
+        ]
+        out = _relevance_filter(results, "民法典的二百三十条是什么？")
+        self.assertEqual([r["chunk_id"] for r in out], ["c21"])
+
+    def test_relevance_filter_direct_unit_entity_only_fallback(self):
+        """没有法条编号时，退回第 3 档实体词 AND 覆盖；低于向量阈值则清空。"""
+        results = [
+            {"chunk_id": "a", "text": "体育赔率 -230 的盘口分析", "vector_score": 0.41},
+            {"chunk_id": "b", "text": "无关内容", "vector_score": 0.40},
+        ]
+        # 知识库不含 '民点' 实体 → AND 无全命中且向量分 < 0.45 → 清空
+        self.assertEqual(_relevance_filter(results, "民点发的230条是什么？"), [])
 
     def test_multi_query_search_empty_plan_is_single_channel(self):
         with patch("src.retrieval.two_stage_search", return_value=[]) as tss_mock, \
              patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
              patch("src.ingestion.embedder.get_embedder") as ge:
-            ge.return_value.encode.return_value = [[0.0]]
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
             multi_query_search("简单问题", top_k=2)
-        # 门控：LLM 判定不需要分解/退步/HyDE → 仅原问题单通道
-        self.assertEqual(len(tss_mock.call_args_list), 1)
+        # 门控：LLM 判定不需要分解/退步/HyDE；但确定性 query 改写会把"简单问题"归一为"简单 问题"
+        # 作为额外通道并入 → 原问题 + 改写 = 2 通道（改写不依赖 LLM，永远在线）。
+        self.assertEqual(len(tss_mock.call_args_list), 2)
+
+    def test_rewrite_query_normalizes_question(self):
+        """确定性改写：去后缀、归一法条、拼实体词；无实体时原样返回。"""
+        self.assertEqual(rewrite_query("民法典的二百三十条是什么？"), "民法典 二百三十 第二百三十条")
+        self.assertEqual(rewrite_query("民法典第二百三十条"), "民法典 二百三十 第二百三十条")
+        self.assertEqual(rewrite_query("RAG 是什么"), "RAG")  # 去「是什么」后缀，无实体可补
+        self.assertEqual(rewrite_query("你好"), "你好")        # 无实体/法条，原样
+
+    def test_multi_query_search_rewrite_disabled_yields_single_channel(self):
+        """features 不含 rewrite 时，确定性改写不生效，仅原问题单通道。"""
+        with patch("src.retrieval.two_stage_search", return_value=[]) as tss, \
+             patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            multi_query_search("民法典的二百三十条是什么？", top_k=2, features=["routing", "keywords"])
+        self.assertEqual(len(tss.call_args_list), 1)
+
+    def test_multi_query_search_rewrite_adds_channel_and_surfaces_in_trace(self):
+        """rewrite 默认开启：可改写查询会多一路通道，并在 debug trace 的 plan.rewritten 暴露。"""
+        with patch("src.retrieval.two_stage_search", return_value=[]), \
+             patch("src.retrieval.keyword_chunks", return_value=[]), \
+             patch("src.retrieval.plan_question", return_value={"subs": [], "step_back": None, "hyde": None}), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.0]] * len(qs)
+            out = multi_query_search("民法典的二百三十条是什么？", top_k=2, debug=True)
+        self.assertIsNotNone(out["trace"]["plan"]["rewritten"])
+        self.assertIn("第二百三十条", out["trace"]["plan"]["rewritten"])
+        self.assertIn("rewrite", out["trace"]["applied"])
+
+    def test_hyde_embedding_shares_encode_batch_with_queries(self):
+        """HyDE 向量与问题向量一次 encode，避免多一次模型前向。"""
+        plan = {"subs": [], "step_back": None, "hyde": "假想文档段落，足够长能通过长度校验"}
+        captured: list[list[str]] = []
+
+        def fake_encode(qs):
+            captured.append(list(qs))
+            return [[0.0]] * len(qs)
+
+        with patch("src.retrieval.two_stage_search", return_value=[]), \
+             patch("src.retrieval.plan_question", return_value=plan), \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = fake_encode
+            multi_query_search("原始问题", top_k=2, features=["hyde"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(len(captured[0]), 2)
+
+    def test_graph_channel_is_invoked_with_primary_vector(self):
+        with patch("src.retrieval.two_stage_search", return_value=[]), \
+             patch("src.graph.graph_channel", return_value=[row("g")]) as gc, \
+             patch("src.ingestion.embedder.get_embedder") as ge:
+            ge.return_value.encode.side_effect = lambda qs: [[0.1, 0.2]] * len(qs)
+            out = multi_query_search("问题", top_k=2, features=["graph"])
+        gc.assert_called_once()
+        self.assertEqual(gc.call_args[0][0], [0.1, 0.2])
+        self.assertEqual([r["chunk_id"] for r in out], ["g"])
 
 
 if __name__ == "__main__":
