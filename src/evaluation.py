@@ -284,13 +284,121 @@ def seed_multihop_cases() -> int:
     return added
 
 
+# 参考答案：用于答案级评测（正确性判分）。严格依据语料中的切片撰写，
+# 放在代码里而不是只写库，是为了重建数据库后仍可复现同一套评测基准。
+_REFERENCE_ANSWERS: dict[str, str] = {
+    "什么是 FastAPI？它有什么特点？":
+        "FastAPI 是一个现代、快速（高性能）的 Python Web 框架，用于构建 API，基于标准 Python 类型提示（type hints）。"
+        "其特点：高性能、易学、编码快、可直接用于生产环境。",
+    "第4页的插图是什么？":
+        "第 4 页的插图是一组界面图标：面带微笑的卡通机器人（象征 AI 助手）、红色圆形内含黑色 X（关闭/错误/禁止）、"
+        "绿色圆形内含黑色对勾（确认/通过）、发光的灯泡（灵感/创新），以及 DeepSeek 的蓝色鲸鱼标志和通义（Qwen）的标志。",
+    "ReCite 框架的 CiteLocator 是什么模块、起什么作用？消融实验中把它去掉后，Overall-Strictly F1 大约下降多少？":
+        "CiteLocator 预测引用边界及其必要性标签（Mandatory / Optional），属于逻辑断点感知模块。"
+        "去掉它后 Overall-Strictly F1 从 37.47 骤降到 2.75，约下降 34.7 个百分点。",
+    "论文提出的 8 类引用意图分类体系 CAP-8 指什么？主实验里 ReCite-SFT(CAP-8) 达到的 Strict F1 是多少？":
+        "CAP-8 指论文提出的 8 类引用意图分类体系（8-category Citation Intent Taxonomy，见表 2）。"
+        "主实验中 ReCite-SFT(CAP-8) 取得最高 Strict F1 = 39.15%，优于所有基线；在 ReCite-SFT 之上加入 CAP-8 还有进一步提升。",
+    "QueryPlanner 的训练数据基于多少高密度段落构建？消融实验中移除 QueryPlanner 后 Overall-Strictly F1 会降到多少？":
+        "QueryPlanner 的训练数据基于 7,079 个高密度段落构建。移除后 Overall-Strictly F1 降到 15.77，约下降 21.7 个百分点。",
+    "ReCite 框架的核心设计思路与传统的基于相似度的引用检索有什么区别？它最终 Overall F1 是多少，与次优基线差多少？":
+        "核心思路是把引用检索从「基于相似度的检索」转向「主动的、论断级（claim-level）推理」：一个解耦的 agentic 框架，"
+        "编排定位感知、意图感知查询规划与反思式验证。最终 Overall F1 为 66.37%，比次优基线（Qwen3.5-27B 的 48.04%）高约 18.3 个百分点。",
+    "FastAPI 应用如何在本地创建并启动一个最小示例？fastapi[standard] 安装里哪个依赖专门用来运行本地服务器？":
+        "用 `uv run fastapi dev` 启动开发模式，服务跑在 http://127.0.0.1:8000。"
+        "fastapi[standard] 里由 uvicorn 负责加载并运行应用（含 uvicorn[standard]、uvloop 等高性能服务依赖）。",
+    "FastAPI 自动生成的两套交互式文档分别在哪个网址访问？":
+        "分别是 http://127.0.0.1:8000/docs（Swagger UI）与 http://127.0.0.1:8000/redoc（ReDoc）。",
+}
+
+
+def seed_reference_answers() -> int:
+    """按问题文本回填参考答案（只填还空着的），让答案级评测可复现。返回更新条数。"""
+    ensure_table()
+    updated = 0
+    with connection() as conn:
+        for row in conn.execute("SELECT id, question FROM eval_cases WHERE reference_answer IS NULL"):
+            answer = _REFERENCE_ANSWERS.get(row["question"])
+            if not answer:
+                continue
+            conn.execute(
+                "UPDATE eval_cases SET reference_answer = %s WHERE id = %s",
+                [answer, row["id"]],
+            )
+            updated += 1
+    return updated
+
+
+def evaluate_answers(
+    configs: list[tuple[str, list[str] | None]] | None = None,
+    run_label: str = "default",
+    limit: int | None = None,
+    top_k: int = 5,
+    mode: str = "pipeline",
+    llm: Any | None = None,
+) -> list[dict]:
+    """答案级评测：逐例生成回答 → 判忠实度/正确性 → 落库并汇总。
+
+    与检索级 run_ablation 的分工：那里回答「资料找没找到」，这里回答「回答有没有胡说」。
+    忠实度取「被来源支撑的论断占比」，直接量化幻觉；正确性需要 reference_answer。
+    """
+    from src.judge import generate_answer, judge_correctness, judge_faithfulness, save_result
+
+    cases = load_cases()
+    if limit is not None:
+        cases = cases[:limit]
+    if configs is None:
+        configs = [("pipeline(含改写)", None)]
+
+    summary: list[dict] = []
+    for label, features in configs:
+        faith_sum = corr_sum = 0.0
+        faith_n = corr_n = 0
+        unsupported_total = 0
+        for case in cases:
+            generated = generate_answer(
+                case["question"], top_k=top_k, features=features, mode=mode, llm=llm
+            )
+            answer, sources = generated["answer"], generated["sources"]
+            faith = judge_faithfulness(case["question"], answer, sources, llm=llm)
+            correct = judge_correctness(case["question"], answer, case["reference_answer"], llm=llm)
+            save_result(run_label, case["id"], label, faith, correct, answer)
+            if faith and faith["score"] is not None:
+                faith_sum += faith["score"]
+                faith_n += 1
+                unsupported_total += faith["unsupported_count"]
+            if correct and correct["score"] is not None:
+                corr_sum += correct["score"]
+                corr_n += 1
+            print(
+                f"  [{label}] #{case['id']} "
+                f"faithfulness={'—' if not faith or faith['score'] is None else faith['score']} "
+                f"correctness={'—' if not correct else correct['score']} "
+                f"unsupported={0 if not faith else faith['unsupported_count']}/{0 if not faith else faith['claim_count']}",
+                flush=True,
+            )
+        summary.append({
+            "label": label,
+            "cases": len(cases),
+            "faithfulness": round(faith_sum / faith_n, 4) if faith_n else None,
+            "correctness": round(corr_sum / corr_n, 4) if corr_n else None,
+            "unsupported_claims": unsupported_total,
+        })
+    return summary
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="检索消融评测")
-    parser.add_argument("cmd", nargs="?", default="run", choices=["run", "add", "list", "seed-multihop"])
+    parser = argparse.ArgumentParser(description="检索消融评测 / 答案级评测")
+    parser.add_argument(
+        "cmd", nargs="?", default="run",
+        choices=["run", "add", "list", "seed-multihop", "seed-answers", "answers"],
+    )
     parser.add_argument("extra", nargs="*", default=[])
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--agent", action="store_true", help="追加 agent 消融行并输出成本列")
     parser.add_argument("--agent-steps", type=int, default=6)
+    parser.add_argument("--limit", type=int, default=None, help="答案级评测只跑前 N 条（控成本）")
+    parser.add_argument("--label", default="default", help="答案级评测的运行标签（用于跨配置比较）")
     ns = parser.parse_args()
 
     if ns.cmd == "add":
@@ -304,6 +412,26 @@ def main() -> None:
 
     if ns.cmd == "seed-multihop":
         print(f"新增 {seed_multihop_cases()} 条多跳评测例（已有则跳过）")
+        return
+
+    if ns.cmd == "seed-answers":
+        print(f"回填参考答案 {seed_reference_answers()} 条（仅填空缺）")
+        return
+
+    if ns.cmd == "answers":
+        if not load_cases():
+            print("eval_cases 为空，先 add 评测例")
+            return
+        configs: list[tuple[str, list[str] | None]] = [("pipeline(含改写)", None)]
+        if ns.agent:
+            configs.append((f"agent(steps={ns.agent_steps})", None))
+        print(f"答案级评测 label={ns.label} limit={ns.limit or '全部'}")
+        for row in evaluate_answers(configs=configs, run_label=ns.label, limit=ns.limit, top_k=ns.k):
+            print(
+                f"{row['label']:<24} cases={row['cases']:<3} "
+                f"faithfulness={row['faithfulness']} correctness={row['correctness']} "
+                f"未支撑论断={row['unsupported_claims']}"
+            )
         return
 
     ensure_table()
