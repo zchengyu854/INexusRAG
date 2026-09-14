@@ -23,9 +23,12 @@ CREATE TABLE IF NOT EXISTS eval_cases (
     id SERIAL PRIMARY KEY,
     question TEXT NOT NULL,
     expected_refs TEXT NOT NULL,
-    reference_answer TEXT
+    reference_answer TEXT,
+    -- manual = 人工编写；generated = 脚本从语料自动生成（便于只统计人工子集）
+    origin TEXT NOT NULL DEFAULT 'manual'
 )
 """
+_TABLE_ALTER = "ALTER TABLE eval_cases ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'manual'"
 
 # runner(question, top_k, features) → list[dict] 或 {"results": [...], "cost": {...}}
 AblationRunner = Callable[[str, int, list[str] | None], Any]
@@ -34,20 +37,31 @@ AblationRunner = Callable[[str, int, list[str] | None], Any]
 def ensure_table() -> None:
     with connection() as conn:
         conn.execute(_TABLE)
+        # 存量库补列（CREATE TABLE IF NOT EXISTS 不会给已有表加列）
+        conn.execute(_TABLE_ALTER)
 
 
-def add_case(question: str, expected_refs: str, reference_answer: str | None = None) -> int:
+def add_case(
+    question: str,
+    expected_refs: str,
+    reference_answer: str | None = None,
+    origin: str = "manual",
+) -> int:
     ensure_table()
     with connection() as conn:
         row = conn.execute(
-            "INSERT INTO eval_cases (question, expected_refs, reference_answer) VALUES (%s, %s, %s) RETURNING id",
-            [question, expected_refs, reference_answer],
+            "INSERT INTO eval_cases (question, expected_refs, reference_answer, origin)"
+            " VALUES (%s, %s, %s, %s) RETURNING id",
+            [question, expected_refs, reference_answer, origin],
         ).fetchone()
     return int(row["id"])
 
 
-def load_cases(conn: Any | None = None) -> list[dict]:
+def load_cases(conn: Any | None = None, origin: str | None = None) -> list[dict]:
     """评测例列表。expected 为 'doc_name:chunk_index' 集合，expected_refs 保留原始串供 API 回显。
+
+    origin 过滤：None=全部；'manual'/'generated' 只取对应子集。合成题与真实提问的
+    结论方向可能相反（见 eval-report §9.4），聚合必须能按来源拆开看。
 
     传入 conn 时复用调用方事务：批量改写引用的脚本必须在同一事务内读到自己的写入，
     否则后一篇文档会基于旧值重写、覆盖前一篇的结果。
@@ -55,16 +69,21 @@ def load_cases(conn: Any | None = None) -> list[dict]:
     if conn is None:
         ensure_table()
         with connection() as own:
-            return load_cases(own)
-    rows = list(conn.execute(
-        "SELECT id, question, expected_refs, reference_answer FROM eval_cases ORDER BY id"
-    ))
+            return load_cases(own, origin=origin)
+    sql = "SELECT id, question, expected_refs, reference_answer, origin FROM eval_cases"
+    params: list[Any] = []
+    if origin is not None:
+        sql += " WHERE origin = %s"
+        params.append(origin)
+    sql += " ORDER BY id"
+    rows = list(conn.execute(sql, params))
     return [
         {
             "id": r["id"],
             "question": r["question"],
             "expected_refs": r["expected_refs"] or "",
             "reference_answer": r["reference_answer"],
+            "origin": r.get("origin") or "manual",
             "expected": set(filter(None, (r["expected_refs"] or "").split("|"))),
         }
         for r in rows
@@ -164,13 +183,15 @@ def agent_runner(
 def run_ablation(
     configs: list[tuple],
     top_k: int = 5,
+    origin: str | None = None,
 ) -> list[dict]:
     """对每个评测例跑一组配置，输出平均指标行。
 
     configs 项为 (label, features) 或 (label, features, runner)。
     runner 缺省为 multi_query_search；可返回 list 或 {"results", "cost"}。
+    origin 过滤评测例子集（None=全部），供人工/自动题分开统计。
     """
-    cases = load_cases()
+    cases = load_cases(origin=origin)
     rows = []
     for item in configs:
         if len(item) == 2:
@@ -215,7 +236,11 @@ def run_ablation(
 
 
 def default_eval_configs(*, include_agent: bool = False, agent_steps: int = 6) -> list[tuple]:
-    """默认消融矩阵；include_agent 时追加 agent 行（同口径 Hit@K + 成本）。"""
+    """默认消融矩阵；include_agent 时追加 agent 行（同口径 Hit@K + 成本）。
+
+    rewrite 已在 n=63 上判定为负向并移出默认集（eval-report §9.3），矩阵里保留
+    显式 "+rewrite" 行作为持续监控：它的差值一旦回正，再考虑恢复默认开启。
+    """
     import os as _os
 
     from src.retrieval import ALL_FEATURES, _DEFAULT_FEATURES
@@ -223,9 +248,8 @@ def default_eval_configs(*, include_agent: bool = False, agent_steps: int = 6) -
     strategy = _os.getenv("RERANK_STRATEGY", "rrf")
     configs: list[tuple] = [
         ("none(纯向量)", []),
-        ("default(含改写)", None),
-        # rewrite 消融对照：默认集只去掉改写，其余不变——差值即改写通道的增益
-        ("default-改写(关)", [f for f in _DEFAULT_FEATURES if f != "rewrite"]),
+        ("default", None),
+        ("+rewrite", list(_DEFAULT_FEATURES) + ["rewrite"]),
         ("+graph", list(_DEFAULT_FEATURES) + ["graph"]),
         ("+graph+rerank", list(_DEFAULT_FEATURES) + ["graph", "rerank"]),
         (f"all(+rerank:{strategy})", list(ALL_FEATURES)),
@@ -237,6 +261,17 @@ def default_eval_configs(*, include_agent: bool = False, agent_steps: int = 6) -
         configs.append((f"agent(steps={agent_steps})", None, _agent))
         configs.append((f"agent+graph(steps={agent_steps})", ["graph"], _agent))
     return configs
+
+
+# 确定性消融：只含不调 LLM 的通道（routing/keywords/rewrite），两轮完全可复现，
+# 是报告 §9 表格的可复现入口（python -m src.evaluation run --deterministic）。
+_DETERMINISTIC_CONFIGS: list[tuple] = [
+    ("none(纯向量)", []),
+    ("routing", ["routing"]),
+    ("keywords", ["keywords"]),
+    ("routing+keywords", ["routing", "keywords"]),
+    ("routing+keywords+rewrite", ["routing", "keywords", "rewrite"]),
+]
 
 
 # 多跳评测例：答案需要拼接同一文档中相距较远的两块内容。
@@ -420,6 +455,14 @@ def main() -> None:
     parser.add_argument("--agent-steps", type=int, default=6)
     parser.add_argument("--limit", type=int, default=None, help="答案级评测只跑前 N 条（控成本）")
     parser.add_argument("--label", default="default", help="答案级评测的运行标签（用于跨配置比较）")
+    parser.add_argument(
+        "--origin", choices=["all", "manual", "generated"], default="all",
+        help="评测例子集：人工编写 / 脚本自动生成（合成题与真实提问的结论可能方向相反，须分开看）",
+    )
+    parser.add_argument(
+        "--deterministic", action="store_true",
+        help="只跑不调 LLM 的确定性配置（routing/keywords/rewrite），两轮完全可复现",
+    )
     ns = parser.parse_args()
 
     if ns.cmd == "add":
@@ -443,7 +486,7 @@ def main() -> None:
         if not load_cases():
             print("eval_cases 为空，先 add 评测例")
             return
-        configs: list[tuple] = [("pipeline(含改写)", None, "pipeline")]
+        configs: list[tuple] = [("pipeline(默认特性)", None, "pipeline")]
         if ns.agent:
             # 必须带上 mode，否则只是换了个标签、实际仍在跑管线
             configs.append((f"agent(steps={ns.agent_steps})", None, "agent"))
@@ -461,15 +504,23 @@ def main() -> None:
             )
         return
 
+    origin = None if ns.origin == "all" else ns.origin
     ensure_table()
-    if not load_cases():
-        print("eval_cases 为空：先 `python -m src.evaluation add \"问题\" \"doc:idx|doc:idx\"`")
+    cases = load_cases(origin=origin)
+    if not cases:
+        hint = "" if origin is None else f"（origin={origin} 子集为空，试试 --origin all）"
+        print(f"eval_cases 为空{hint}：先 `python -m src.evaluation add \"问题\" \"doc:idx|doc:idx\"`")
         return
-    print(f"K={ns.k}" + ("  (+agent)" if ns.agent else ""))
-    for row in run_ablation(
-        default_eval_configs(include_agent=ns.agent, agent_steps=ns.agent_steps),
-        top_k=ns.k,
-    ):
+    print(
+        f"K={ns.k}  n={len(cases)}"
+        + (f"  origin={ns.origin}" if origin else "")
+        + ("  (+agent)" if ns.agent else "")
+        + ("  (deterministic)" if ns.deterministic else "")
+    )
+    configs = _DETERMINISTIC_CONFIGS if ns.deterministic else default_eval_configs(
+        include_agent=ns.agent, agent_steps=ns.agent_steps,
+    )
+    for row in run_ablation(configs, top_k=ns.k, origin=origin):
         line = f"{row['label']:<28} hit@{ns.k}={row['hit@k']:<8} mrr={row['mrr']}"
         if "avg_steps" in row:
             line += (
