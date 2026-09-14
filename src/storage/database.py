@@ -46,30 +46,47 @@ class _ConnectionPool:
         self._created = 0
         self._lock = threading.Lock()
         for _ in range(self._min):
-            self._queue.put(self._connect())
+            if self._reserve():
+                self._queue.put(self._connect())
+
+    def _reserve(self) -> bool:
+        """在锁内占一个名额；真正的连库放在锁外。
+
+        不能在持锁时调用 _connect —— threading.Lock 不可重入，_connect 里再取锁会
+        自死锁。单请求时队列里预建的连接掩盖了这个问题，一旦嵌套或并发需要第二条
+        连接就会永久挂住。
+        """
+        with self._lock:
+            if self._created >= self._max:
+                return False
+            self._created += 1
+            return True
+
+    def _release(self) -> None:
+        with self._lock:
+            self._created = max(0, self._created - 1)
 
     def _connect(self) -> psycopg.Connection:
-        conn = psycopg.connect(self._conninfo, row_factory=dict_row)
-        with self._lock:
-            self._created += 1
-        return conn
+        return psycopg.connect(self._conninfo, row_factory=dict_row)
 
     def getconn(self, timeout: float = 30.0) -> psycopg.Connection:
         try:
             return self._queue.get_nowait()
         except Empty:
             pass
-        with self._lock:
-            if self._created < self._max:
+        if self._reserve():
+            try:
                 return self._connect()
+            except Exception:
+                self._release()
+                raise
         return self._queue.get(timeout=timeout)
 
     def putconn(self, conn: psycopg.Connection | None) -> None:
         if conn is None:
             return
         if conn.closed:
-            with self._lock:
-                self._created = max(0, self._created - 1)
+            self._release()
             return
         try:
             # 归还前清掉未提交事务，避免脏连接污染下一个调用方
@@ -81,15 +98,13 @@ class _ConnectionPool:
                 conn.close()
             except Exception:
                 pass
-            with self._lock:
-                self._created = max(0, self._created - 1)
+            self._release()
             return
         try:
             self._queue.put_nowait(conn)
         except Full:
             conn.close()
-            with self._lock:
-                self._created = max(0, self._created - 1)
+            self._release()
 
     def close(self) -> None:
         while True:
