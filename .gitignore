@@ -67,3 +67,7 @@ models/
 # Personal notes (interview prep, not project content)
 docs/project-storyline.md
 docs/resume-guide.md
+
+# Policy: only code is published — all documents stay local
+docs/
+*.md
