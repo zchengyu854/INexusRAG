@@ -279,6 +279,8 @@ uv run python -m src.graph reset
 uv run pytest
 ```
 
+pytest 在 `dev` 依赖组里，`uv sync` 会自动安装；`pythonpath` 已在 `pyproject.toml` 配好，克隆后在仓库根目录直接跑即可。
+
 227 个测试，LLM / embedder 全部打桩，**离线可跑、不连数据库、不调外部服务**。关键逻辑（`_gate_keyword_rows`、RRF 量纲、相关性过滤、上传幂等、降级路径）都有对应测试。
 
 ---
