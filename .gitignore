@@ -73,3 +73,6 @@ docs/
 *.md
 # ...except the root README, which fronts the repo (anchored to root only)
 !/README.md
+
+# Downloaded corpus (public-domain sources, not code)
+data/corpus/
